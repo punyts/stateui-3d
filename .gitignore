@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.build-stamp
+test-results/
+__screenshots__/
+.vitest-attachments/
+# The G3.1 feasibility spike (graphics epic 3), kept on disk until G3.2 ends
+spike/
