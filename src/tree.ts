@@ -27,6 +27,26 @@ export interface Scene3dTree {
     readonly row?: Scene3dTree;
 }
 
+/**
+ * The scene's own properties (the `scene3d` node's), as the feeder reads them. `background` and `ambient` are colours
+ * (literals or token references, resolved with the scene's `resolveColor`); the feeder passes the `scene3d.background`
+ * and `scene3d.ambient` tokens when the node sets none. `environment` other than `none` adds an ambient light of the
+ * `ambient` colour (the presets themselves come with G3.5b). An unset `background` leaves the canvas transparent, so the
+ * host's own background shows
+ */
+export interface Scene3dSettings {
+    readonly background?: JsonValue;
+    readonly ambient?: JsonValue;
+    readonly environment?: JsonValue;
+}
+
+/**
+ * Resolves a colour value of a node or of the scene (a literal such as `#ff8800`, or a token reference such as
+ * `{color.accent.base}`) to a CSS colour, or undefined when it is unset or names nothing. The feeder passes it (the
+ * component library's paint resolver reading the host's computed style), so the package depends on no StateUI package
+ */
+export type ColorResolver = (value: JsonValue) => string | undefined;
+
 /** A point or a size in scene units, `[x, y, z]` */
 export type Vector3Tuple = readonly [number, number, number];
 

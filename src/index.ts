@@ -1,9 +1,20 @@
 import type { createScene3d } from './scene3d.js';
 
-export { createScene3d, DEFAULT_CAMERA_POSITION, DEFAULT_FOV } from './scene3d.js';
+export { createScene3d } from './scene3d.js';
 export type { Scene3d, Scene3dOptions } from './scene3d.js';
+export { DEFAULT_CAMERA_POSITION, DEFAULT_FOV, DEFAULT_VIEW_DIRECTION, FRAME_MARGIN, activeCamera, frameBounds, orthographicHeight } from './cameras.js';
+export type { CameraFrame } from './cameras.js';
+export { changedProperties, diffTrees, flattenTree, sameValue } from './diff.js';
+export type { FlatNode, TreeDiff } from './diff.js';
+export { GEOMETRY_KINDS, MAX_SEGMENTS, MAX_SIZE, MIN_SEGMENTS, geometryParams, isGeometryKind } from './geometries.js';
+export type { GeometryKind, GeometryParams } from './geometries.js';
+export { DEFAULT_MESH_COLOR, DEFAULT_METALNESS, DEFAULT_ROUGHNESS, materialParams } from './materials.js';
+export type { MaterialParams } from './materials.js';
+export { FALLBACK_SIZE, MAX_PIXEL_RATIO, Scene3dError, isScene3dError } from './renderer.js';
+export type { Scene3dErrorCode } from './renderer.js';
+export { ENVIRONMENT_AMBIENT, LIGHT_SCALE, lightIntensity } from './scene.js';
 export { NODE3D_KINDS, isNode3dKind } from './tree.js';
-export type { Bounds3d, JsonValue, Node3dKind, Scene3dTree, Vector3Tuple } from './tree.js';
+export type { Bounds3d, ColorResolver, JsonValue, Node3dKind, Scene3dSettings, Scene3dTree, Vector3Tuple } from './tree.js';
 export { VERSION } from './version.js';
 
 /** The name of the one global the runtime chunk sets on the page */
