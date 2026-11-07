@@ -3,6 +3,7 @@ import type { BufferGeometry, Group } from 'three';
 import { sameValue } from './diff.js';
 import { createGeometry, geometryParams } from './geometries.js';
 import { DEFAULT_MESH_COLOR, applyMaterial, materialParams } from './materials.js';
+import type { MapTextures } from './textures.js';
 import type { ColorResolver, JsonValue, Scene3dTree, Vector3Tuple } from './tree.js';
 
 /**
@@ -191,7 +192,8 @@ export class InstanceLayout {
 }
 
 /**
- * The properties of a repeat's row that every instance shares: the geometry, the material but its colour, and the
+ * The properties of a repeat's row that every instance shares: the geometry, the material but its colour (its `map`
+ * among it, G3.7c: one texture for every instance, tinted by each instance's colour), and the
  * shadow flags. They are taken from the first copy; the `scene3d` component reports a row whose copies differ in one
  * (`SUI-RUN-DRAW`). Each instance has its own `position`, `rotation`, `scale`, `visible`/`hidden` and `material.color`
  */
@@ -216,10 +218,15 @@ export class RepeatInstances {
     /** The shared values the mesh was made with, copied */
     private shared: { geometry?: JsonValue; material?: JsonValue } = {};
 
+    /**
+     * @param maps The scene's map textures and the repeat's path (G3.7c): the shared material takes the first copy's
+     * `material.map`, read once for the repeat and freed with its material. Without it no map is drawn
+     */
     constructor(
         private readonly group: Group,
         private readonly resolve: ColorResolver,
-        private readonly convert: (css: string) => Color | undefined
+        private readonly convert: (css: string) => Color | undefined,
+        private readonly maps?: { readonly textures: MapTextures; readonly path: string }
     ) {}
 
     /** The instanced mesh while the repeat draws any instance (a test and the ray cast read it) */
@@ -310,6 +317,7 @@ export class RepeatInstances {
         if (this.material === undefined || !sameValue(this.shared.material, material)) {
             this.material ??= new MeshStandardMaterial();
             applyMaterial(this.material, { ...materialParams(material, this.resolve), color: DEFAULT_MESH_COLOR }, this.convert);
+            this.maps?.textures.set(this.maps.path, 'repeat3d', material, this.material);
             this.shared.material = material === undefined ? undefined : (JSON.parse(JSON.stringify(material)) as JsonValue);
         }
         if (this.mesh !== undefined) {
@@ -361,6 +369,7 @@ export class RepeatInstances {
         }
         this.geometry?.dispose();
         this.geometry = undefined;
+        this.maps?.textures.release(this.maps.path);
         this.material?.dispose();
         this.material = undefined;
         this.shared = {};

@@ -125,12 +125,13 @@ describe('createScene3d', () => {
         expect(scene.boundsOf(`${ROOT}.box`)).toBeUndefined();
     });
 
-    it('should have no element for a node yet', () => {
+    it('should have the proxy button of an interactive node as its element, and none for another node (G3.8)', () => {
         // Arrange
-        scene.update([node('mesh', 'box', { interactive: true })]);
+        scene.update([node('mesh', 'box', { interactive: true }), node('mesh', 'plain')]);
 
         // Assert
-        expect(scene.elementOf(`${ROOT}.box`)).toBeUndefined();
+        expect(scene.elementOf(`${ROOT}.box`)?.getAttribute('data-shape-path')).toBe(`${ROOT}.box`);
+        expect(scene.elementOf(`${ROOT}.plain`)).toBeUndefined();
     });
 
     it('should keep the reduced motion setting', () => {

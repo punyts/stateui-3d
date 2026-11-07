@@ -25,7 +25,7 @@ const unit = (value: JsonValue | undefined, fallback: number): number =>
 /**
  * The parameters of a `mesh`'s `material` value: `color` resolved by `resolve` (white when unset or unresolved),
  * `metalness`, `roughness` and `opacity` kept in 0..1 (defaults 0, 1 and 1), `emissive` resolved (none when unset).
- * `map` (a texture file) is G3.7c and is not read here. Pure, apart from what `resolve` does
+ * `map` (a picture file) is read and drawn by `MapTextures` (`textures.ts`, G3.7c). Pure, apart from what `resolve` does
  */
 export function materialParams(value: JsonValue | undefined, resolve: ColorResolver): MaterialParams {
     const material = isObject(value) ? value : {};

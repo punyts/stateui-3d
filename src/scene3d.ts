@@ -3,6 +3,8 @@ import type { Camera, Object3D } from 'three';
 import { DEFAULT_FOV, activeCamera, frameBounds, orthographicHeight } from './cameras.js';
 import { controlsMode, createCameraControls } from './controls.js';
 import type { CameraMove, CameraView } from './controls.js';
+import { PressGesture, interactiveNodes, screenBox } from './interaction.js';
+import { createProxies } from './proxies.js';
 import { createColorConverter } from './materials.js';
 import { createMotion3d } from './motion.js';
 import type { Rgb } from './motion.js';
@@ -55,12 +57,30 @@ export interface Scene3dOptions {
      */
     readonly keyTarget?: Element;
     /**
-     * Reads the bytes of a stored file by its id, for a `model`'s `src` (G3.7b): the `scene3d` component reads them
-     * through the host (`ui-file-read`). Without it a model with a file is told to `onIssue` as `file` `offline`
+     * Reads the bytes of a stored file by its id, for a `model`'s `src` (G3.7b) and a `mesh`'s `material.map` (G3.7c): the
+     * `scene3d` component reads them through the host (`ui-file-read`). Without it a model or map with a file is told
+     * to `onIssue` as `file` `offline`
      */
     readonly readFile?: ReadSceneFile;
-    /** Told when a node cannot draw (`Scene3dIssue`: a model's file or its bytes); the other nodes draw */
+    /** Told when a node cannot draw (`Scene3dIssue`: a model's file or its bytes, a map's file); the other nodes draw */
     readonly onIssue?: (issue: Scene3dIssue) => void;
+    /**
+     * Told a `press` or a `hover` of an interactive node (G3.8, `Scene3dEvent`): the `scene3d` component raises it on
+     * its element for the dispatcher, which runs the `on` entry of the node `shape` names
+     */
+    readonly onEvent?: (event: Scene3dEvent) => void;
+}
+
+/**
+ * A `press` or a `hover` (entering only) of an interactive node (G3.8): `shape` is the node's state path
+ * (`<repeat>.rows.<recordKey>` for a `repeat3d` copy), `key` its key (a copy's record key), `point` the point of the
+ * node in world space: where the ray hit it, or the centre of its bounds for a press through its proxy
+ */
+export interface Scene3dEvent {
+    readonly name: 'press' | 'hover';
+    readonly shape: string;
+    readonly key: string;
+    readonly point: Vector3Tuple;
 }
 
 /** What `onStatus` of the scene's options is told (see there) */
@@ -83,6 +103,8 @@ export interface Scene3dInfo {
     readonly environment: string | undefined;
     /** The `model` nodes whose file is being read or parsed, and those drawn */
     readonly models: { readonly loading: number; readonly loaded: number };
+    /** The `material.map`s whose file is being read or decoded, and those drawn (G3.7c) */
+    readonly maps: { readonly loading: number; readonly loaded: number };
     /** The tweens of `transition` running (G3.9) */
     readonly tweens: number;
     /** The instances the `repeat3d` nodes draw (G3.6) */
@@ -112,7 +134,10 @@ export interface Scene3d {
      * path (`<repeat>.rows.<recordKey>`) gives the bounds of its instance (G3.6)
      */
     boundsOf(path: string): Bounds3d | undefined;
-    /** The element that stands for a node (by its path), the proxy button of an interactive node; undefined when there is none */
+    /**
+     * The element that stands for a node (by its path): the proxy button of an interactive node that is drawn (G3.8);
+     * undefined when there is none
+     */
     elementOf(path: string): Element | undefined;
     /**
      * Resolves every colour again (the scene's own, the environment's ambient and fog, and the nodes'), without making
@@ -129,7 +154,8 @@ export interface Scene3d {
     /**
      * Resolves once the last `update` is on screen: after the frame it asked for, at once when none is waiting. While
      * the WebGL context is lost it waits for the frame after the restore, and while a `model`'s file is read or parsed
-     * it waits for the frame after the last one has loaded or failed (G3.7b). A feeder marks itself ready then (the
+     * it waits for the frame after the last one has loaded or failed (G3.7b), and so for a `material.map`'s file (G3.7c).
+     * A feeder marks itself ready then (the
      * scene host's `data-render`). Resolves at once after `dispose`
      */
     drawn(): Promise<void>;
@@ -152,6 +178,9 @@ function instanceCopy(object: Object3D, instanceId: number | undefined): Scene3d
     return instanceId === undefined || layout === undefined ? undefined : layout.treeAt(instanceId);
 }
 
+/** A number without the noise of the matrix maths (the point of a press or a hover, G3.8) */
+const clean = (value: number): number => Math.round(value * 1e6) / 1e6 + 0;
+
 /** True when the object and every ancestor up to the root are visible */
 function shown(object: Object3D | null, root: Object3D): boolean {
     for (let current = object; current && current !== root; current = current.parent) {
@@ -163,7 +192,8 @@ function shown(object: Object3D | null, root: Object3D): boolean {
 /**
  * Makes a scene in `host`: a canvas that follows the host's size (`ResizeObserver`), a `WebGLRenderer` (`renderer.ts`)
  * and a three.js scene built from the node trees given to `update` (`scene.ts`: `camera`, `light`, `mesh`, `group3d`,
- * `model`, whose GLB file it reads with `readFile` and parses with no URL, `models.ts`, and `repeat3d`, whose copies
+ * `model`, whose GLB file it reads with `readFile` and parses with no URL, `models.ts`, a `mesh`'s `material.map`,
+ * whose picture file it reads the same way and decodes to an `ImageBitmap`, `textures.ts`, and `repeat3d`, whose copies
  * it draws as one instanced mesh, `instances.ts`). It draws through the active camera (`activeCamera`: the first `camera` with
  * `active: true`, else the first one), or, with none, a default perspective camera that frames the bounds of what is
  * drawn (`frameBounds`). Switching the active camera, the environment preset or the fog makes no node again.
@@ -177,7 +207,17 @@ function shown(object: Object3D | null, root: Object3D): boolean {
  * With `controls` `orbit` or `pan` in the settings (G3.8b, `controls.ts`), a pointer drag, the wheel and the keys of
  * `keyTarget` move the camera in the renderer on every frame of the gesture (each frame tells `onStatus` `pending`),
  * and the active camera node's `position` and `target` go to `onCamera` once when the gesture ends. With `none` (the
- * default) the scene takes no pointer, wheel or key input.
+ * default) the scene takes no pointer, wheel or key input for the camera.
+ *
+ * Press and hover (G3.8, `interaction.ts` and `proxies.ts`): a primary pointer that goes down and up on the canvas
+ * within `PRESS_SLOP` pixels, while the controls did not move the camera, is a `press` of the interactive node `hit`
+ * finds under the release (a drag to rotate is never a press); nothing on empty space or on a node that is not
+ * interactive. The pointer entering an interactive node, with no button down, is a `hover`, once per entry. Both go to
+ * `onEvent` with the point the ray hit. Each interactive node that is drawn gets a proxy button (`createProxies`, in a
+ * `proxies` layer before the canvas, in tree order), placed over the box its bounds cover on the canvas after every
+ * frame that draws (so it follows the node, a tween and the camera); `elementOf` gives it. A click on a proxy, or Enter
+ * or Space on a focused one, is a `press` at the centre of the node's bounds. The canvas shows the `move` cursor while
+ * the scene has controls (a drag moves the view, wherever it starts), else `pointer` over an interactive node.
  *
  * A node with `transition` (G3.9, `motion.ts`) eases to the values a state change gives its `position`, `rotation`,
  * `scale`, a mesh's `material.color` and `material.opacity`, a light's `intensity` and a camera's `target`, on the
@@ -199,6 +239,13 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     });
     const defaultCamera = new PerspectiveCamera(DEFAULT_FOV, 1, 0.1, 1000);
     const raycaster = new Raycaster();
+    // Press and hover (G3.8): the proxy buttons of the interactive nodes, a pointer's press, the node the pointer is in
+    const proxies = createProxies(host, { press: (path) => pressProxy(path) });
+    const press = new PressGesture();
+    /** The interactive nodes that are drawn, by path: each has a proxy */
+    let interactive = new Map<string, Scene3dTree>();
+    /** The path of the interactive node the pointer is in, so `hover` is told once per entry */
+    let hovered: string | undefined;
     let reducedMotion = options.reducedMotion ?? false;
     let disposed = false;
     let frame: number | undefined;
@@ -337,10 +384,13 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             webgl.shadowMap.enabled = true;
             graph.recompile();
         }
-        webgl.render(graph.scene, currentCamera());
-        // The models being loaded are not on screen yet: waiting goes on until the frame after the last one settles, and
-        // while a transition runs until the frame it ends in (G3.9)
-        if (graph.loadingModels > 0 || motion.running > 0) return;
+        const camera = currentCamera();
+        webgl.render(graph.scene, camera);
+        // G3.8: the proxies follow the nodes and the camera of this frame
+        placeProxies(camera);
+        // The models and maps (G3.7c) being loaded are not on screen yet: waiting goes on until the frame after the last
+        // one settles, and while a transition runs until the frame it ends in (G3.9)
+        if (graph.loading > 0 || motion.running > 0) return;
         const done = waiting;
         waiting = [];
         for (const settle of done) settle();
@@ -396,6 +446,131 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         invalidateByItself();
     }
 
+    // Press and hover (G3.8) ---------------------------------------------------------------------------------------
+
+    /**
+     * The world bounds of the node with this path (a repeat copy's: its instance's), or undefined when it draws nothing.
+     * `update` false when the world matrices are up to date (the proxies are placed after a frame)
+     */
+    function worldBox(path: string, update = true): Box3 | undefined {
+        if (disposed) return undefined;
+        const object = graph.objectOf(path);
+        if (!object) {
+            // A repeat copy's path (`<repeat>.rows.<recordKey>`, G3.6): the bounds of its instance
+            const instance = graph.instanceBounds(path);
+            return instance === undefined || instance.isEmpty() ? undefined : instance;
+        }
+        if (update) graph.root.updateWorldMatrix(true, true);
+        const box = new Box3().setFromObject(object);
+        return box.isEmpty() ? undefined : box;
+    }
+
+    /**
+     * The interactive node drawn at a point of the host in CSS pixels, with the point in world space where the ray met
+     * it: the first node hit, or its nearest interactive ancestor; a `repeat3d` instance gives its copy when that is
+     * interactive (G3.6)
+     */
+    function pick(x: number, y: number): { readonly tree: Scene3dTree; readonly point: Vector3 } | undefined {
+        if (disposed) return undefined;
+        const { width, height } = renderer.size;
+        if (width <= 0 || height <= 0) return undefined;
+        raycaster.setFromCamera(new Vector2((x / width) * 2 - 1, -(y / height) * 2 + 1), currentCamera());
+        for (const intersection of raycaster.intersectObject(graph.root, true)) {
+            if (!shown(intersection.object, graph.root)) continue;
+            // An instance of a repeat3d (G3.6): the copy its index draws, whose key is its record key
+            const copy = instanceCopy(intersection.object, intersection.instanceId);
+            if (copy?.properties.interactive === true) return { tree: copy, point: intersection.point };
+            for (let object: Object3D | null = intersection.object; object && object !== graph.root; object = object.parent) {
+                const tree = object.userData.tree as Scene3dTree | undefined;
+                if (tree?.properties.interactive === true) return { tree, point: intersection.point };
+            }
+        }
+        return undefined;
+    }
+
+    /** Tells `onEvent` a press or a hover of a node, at a point in world space */
+    function raise(name: Scene3dEvent['name'], tree: Scene3dTree, point: Vector3): void {
+        if (disposed || options.onEvent === undefined) return;
+        options.onEvent({ name, shape: tree.path, key: tree.key, point: [clean(point.x), clean(point.y), clean(point.z)] });
+    }
+
+    /** A click on a proxy, or Enter or Space on a focused one: a press at the centre of its node's bounds */
+    function pressProxy(path: string): void {
+        const tree = interactive.get(path);
+        const box = tree === undefined ? undefined : worldBox(path);
+        if (tree !== undefined && box !== undefined) raise('press', tree, box.getCenter(new Vector3()));
+    }
+
+    /** Puts each proxy over the box its node covers on the canvas through the camera of the frame just drawn */
+    function placeProxies(camera: Camera): void {
+        if (proxies.size === 0) return;
+        const { width, height } = renderer.size;
+        graph.root.updateWorldMatrix(true, true);
+        proxies.place((path) => {
+            const box = interactive.has(path) ? worldBox(path, false) : undefined;
+            return box === undefined ? undefined : screenBox(box, camera, width, height);
+        });
+    }
+
+    /** The interactive nodes of a new tree get their proxies, in tree order; a hovered node that went is forgotten */
+    function syncInteractive(tree: readonly Scene3dTree[]): void {
+        const nodes = interactiveNodes(tree);
+        interactive = new Map(nodes.map((node) => [node.path, node]));
+        proxies.sync(nodes);
+        if (hovered !== undefined && !interactive.has(hovered)) hovered = undefined;
+    }
+
+    /** A pointer event's point in CSS pixels from the canvas's top-left corner */
+    function pointAt(event: PointerEvent): [number, number] {
+        const rect = canvas.getBoundingClientRect();
+        return [event.clientX - rect.left, event.clientY - rect.top];
+    }
+
+    const onPointerDown = (event: PointerEvent): void => {
+        if (disposed || event.button !== 0) return;
+        const [x, y] = pointAt(event);
+        press.down(event.pointerId, x, y);
+    };
+
+    /** The pointer moved: farther than the slop makes a press a drag; with no button down, `hover` on entering a node */
+    const onPointerMove = (event: PointerEvent): void => {
+        if (disposed) return;
+        const [x, y] = pointAt(event);
+        press.move(event.pointerId, x, y);
+        // A drag is not a hover, and keeps its cursor
+        if (event.buttons !== 0) return;
+        const found = interactive.size > 0 ? pick(x, y) : undefined;
+        const cursor = controls.mode !== 'none' ? 'move' : found !== undefined ? 'pointer' : '';
+        if (canvas.style.cursor !== cursor) canvas.style.cursor = cursor;
+        const path = found?.tree.path;
+        if (path === hovered) return;
+        hovered = path;
+        if (found !== undefined) raise('hover', found.tree, found.point);
+    };
+
+    /** The pointer went up: a press when it did not move and the camera did not move, of the node under it */
+    const onPointerUp = (event: PointerEvent): void => {
+        if (disposed) return;
+        const [x, y] = pointAt(event);
+        if (!press.up(event.pointerId, x, y)) return;
+        const found = pick(x, y);
+        if (found !== undefined) raise('press', found.tree, found.point);
+    };
+
+    const onPointerCancel = (): void => press.cancel();
+
+    const onPointerLeave = (): void => {
+        hovered = undefined;
+        if (canvas.style.cursor !== '') canvas.style.cursor = '';
+    };
+
+    // Before the controls' own listeners (made with the first settings), so a press is known before their gesture starts
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointercancel', onPointerCancel);
+    canvas.addEventListener('pointerleave', onPointerLeave);
+
     const observer =
         view && 'ResizeObserver' in view
             ? new view.ResizeObserver((entries) => {
@@ -413,7 +588,11 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         canvas,
         keyTarget: options.keyTarget ?? host,
         view: cameraView,
-        draw: invalidateByItself,
+        // G3.8: a pointer gesture that moved the camera is a drag to rotate or pan, never a press
+        draw: () => {
+            press.cameraMoved();
+            invalidateByItself();
+        },
         // G3.9: the camera a gesture writes comes back as state and is shown at once, never tweened back from where it was
         onCamera:
             options.onCamera === undefined
@@ -439,39 +618,20 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             if (settings !== undefined) controls.setMode(controlsMode(settings.controls));
             // The state's camera, not one a transition is moving
             controls.treeChanged(activeCamera(tree));
+            // G3.8: the proxies of the interactive nodes (placed when the frame is drawn)
+            syncInteractive(tree);
             invalidate();
         },
         hit(x, y) {
-            if (disposed) return undefined;
-            const { width, height } = renderer.size;
-            raycaster.setFromCamera(new Vector2((x / width) * 2 - 1, -(y / height) * 2 + 1), currentCamera());
-            for (const intersection of raycaster.intersectObject(graph.root, true)) {
-                if (!shown(intersection.object, graph.root)) continue;
-                // An instance of a repeat3d (G3.6): the copy its index draws, whose key is its record key
-                const copy = instanceCopy(intersection.object, intersection.instanceId);
-                if (copy?.properties.interactive === true) return copy;
-                for (let object: Object3D | null = intersection.object; object && object !== graph.root; object = object.parent) {
-                    const tree = object.userData.tree as Scene3dTree | undefined;
-                    if (tree?.properties.interactive === true) return tree;
-                }
-            }
-            return undefined;
+            return pick(x, y)?.tree;
         },
         boundsOf(path) {
-            const object = disposed ? undefined : graph.objectOf(path);
-            if (!object) {
-                // A repeat copy's path (`<repeat>.rows.<recordKey>`, G3.6): the bounds of its instance
-                const instance = disposed ? undefined : graph.instanceBounds(path);
-                return instance === undefined || instance.isEmpty() ? undefined : { min: instance.min.toArray() as Vector3Tuple, max: instance.max.toArray() as Vector3Tuple };
-            }
-            graph.root.updateWorldMatrix(true, true);
-            const box = new Box3().setFromObject(object);
-            if (box.isEmpty()) return undefined;
-            return { min: [box.min.x, box.min.y, box.min.z], max: [box.max.x, box.max.y, box.max.z] };
+            const box = worldBox(path);
+            return box === undefined ? undefined : { min: box.min.toArray() as Vector3Tuple, max: box.max.toArray() as Vector3Tuple };
         },
-        elementOf() {
-            // The proxy buttons of interactive nodes come with G3.8
-            return undefined;
+        elementOf(path) {
+            // G3.8: the proxy button of an interactive node that is drawn
+            return disposed ? undefined : proxies.elementOf(path);
         },
         restyle() {
             if (disposed) return;
@@ -487,6 +647,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
                 contextLost: lost,
                 environment: graph.environmentPreset,
                 models: { loading: graph.loadingModels, loaded: graph.loadedModels },
+                maps: { loading: graph.loadingMaps, loaded: graph.loadedMaps },
                 tweens: motion.running,
                 instances: graph.instances
             };
@@ -501,7 +662,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             return reducedMotion;
         },
         drawn() {
-            if (disposed || (frame === undefined && !lost && graph.loadingModels === 0 && motion.running === 0)) return Promise.resolve();
+            if (disposed || (frame === undefined && !lost && graph.loading === 0 && motion.running === 0)) return Promise.resolve();
             return new Promise((settle) => waiting.push(settle));
         },
         dispose() {
@@ -518,6 +679,15 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             // Before the renderer forces its context loss, which would otherwise be taken for one to wait out
             canvas.removeEventListener('webglcontextlost', onContextLost);
             canvas.removeEventListener('webglcontextrestored', onContextRestored);
+            // G3.8: press and hover
+            canvas.removeEventListener('pointerdown', onPointerDown);
+            canvas.removeEventListener('pointermove', onPointerMove);
+            canvas.removeEventListener('pointerup', onPointerUp);
+            canvas.removeEventListener('pointercancel', onPointerCancel);
+            canvas.removeEventListener('pointerleave', onPointerLeave);
+            proxies.dispose();
+            interactive = new Map();
+            hovered = undefined;
             controls.dispose();
             scheduler.dispose();
             motion.dispose();

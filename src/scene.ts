@@ -7,7 +7,8 @@ import { createGeometry, geometryParams } from './geometries.js';
 import { applyMaterial, materialParams } from './materials.js';
 import { ModelError, disposeModel, parseModel } from './models.js';
 import { RepeatInstances } from './instances.js';
-import type { ColorResolver, JsonValue, Scene3dSettings, Scene3dTree } from './tree.js';
+import { MapTextures } from './textures.js';
+import type { ColorResolver, JsonValue, Node3dKind, Scene3dSettings, Scene3dTree } from './tree.js';
 import { DEFAULT_FOV } from './cameras.js';
 
 /**
@@ -30,13 +31,17 @@ const REBUILT_BY: Partial<Record<Scene3dTree['kind'], readonly string[]>> = { li
  * `model`'s file cannot be had (its `src` is empty or not a file reference, `no_file`; or the read failed, with the
  * read's code: `not_found`, `offline`, ...), the feeder's `SUI-RUN-FILE`; `model` when the file's bytes cannot be drawn
  * (a `ModelError`: `not_glb`, `draco`, `meshopt`, `ktx2`, `external_uri` or `invalid_glb`, followed by what in the file
- * it is about), the feeder's `SUI-RUN-3D`. The other nodes draw
+ * it is about), the feeder's `SUI-RUN-3D`. A `mesh`'s `material.map` (G3.7c) is a `file` issue too: a value that is not
+ * a picture file (`unsupported_type`), a failed read (its code) or bytes that do not decode (`not_an_image`); for a
+ * `repeat3d`, whose instances share the first copy's map, at the repeat's path. The other nodes draw
  */
 export interface Scene3dIssue {
     readonly kind: 'file' | 'model';
     /** The state path of the node */
     readonly path: string;
     readonly reason: string;
+    /** The kind of the node (`model`, or `mesh` and `repeat3d` for a map, G3.7c); unset is a `model` */
+    readonly node?: Node3dKind;
 }
 
 /**
@@ -46,12 +51,12 @@ export interface Scene3dIssue {
  */
 export type ReadSceneFile = (id: string, signal: AbortSignal) => Promise<ArrayBuffer>;
 
-/** How the graph reads the models' files and what it tells about them */
+/** How the graph reads the files of the models and of the meshes' maps (G3.7c), and what it tells about them */
 export interface ModelHooks {
-    /** Reads a model's file; without it every model with a file is a `file` issue `offline` */
+    /** Reads a model's or a map's file; without it every model or map with a file is a `file` issue `offline` */
     readonly readFile?: ReadSceneFile;
     readonly onIssue?: (issue: Scene3dIssue) => void;
-    /** A model finished loading, or failed: the scene draws again (and stops waiting for it) */
+    /** A model or a map finished loading, or failed: the scene draws again (and stops waiting for it) */
     readonly onSettled?: () => void;
 }
 
@@ -112,6 +117,8 @@ export class SceneGraph {
     private readonly models = new Map<string, ModelLoad>();
     /** The instances of each `repeat3d` node (G3.6), by the node's path */
     private readonly repeats = new Map<string, RepeatInstances>();
+    /** The textures of the meshes' and repeats' `material.map`s (G3.7c), by the node's path */
+    private readonly maps: MapTextures;
 
     constructor(
         private readonly resolve: ColorResolver,
@@ -119,6 +126,7 @@ export class SceneGraph {
         private readonly hooks: ModelHooks = {}
     ) {
         this.scene.add(this.root, this.environment);
+        this.maps = new MapTextures(hooks);
     }
 
     /** The tree last given to `sync` */
@@ -153,6 +161,21 @@ export class SceneGraph {
         let loaded = 0;
         for (const load of this.models.values()) if (load.content !== undefined) loaded += 1;
         return loaded;
+    }
+
+    /** The maps whose file is being read or decoded (G3.7c) */
+    get loadingMaps(): number {
+        return this.maps.loading;
+    }
+
+    /** The maps drawn (G3.7c) */
+    get loadedMaps(): number {
+        return this.maps.loaded;
+    }
+
+    /** The models and maps whose file is being read: the scene's `drawn()` waits until none is */
+    get loading(): number {
+        return this.loadingModels + this.maps.loading;
     }
 
     /** The instances of the `repeat3d` node with this path (G3.6) */
@@ -295,6 +318,7 @@ export class SceneGraph {
         this.environmentName = undefined;
         this.scene.fog = null;
         this.fog = undefined;
+        this.maps.clear();
     }
 
     /** A colour value resolved and converted, or undefined when it names no colour */
@@ -338,7 +362,7 @@ export class SceneGraph {
             case 'repeat3d': {
                 // The copies are drawn as one instanced mesh in this group (G3.6, `instances.ts`), synced after the nodes
                 const group = new Group();
-                this.repeats.set(tree.path, new RepeatInstances(group, this.resolve, this.convert));
+                this.repeats.set(tree.path, new RepeatInstances(group, this.resolve, this.convert, { textures: this.maps, path: tree.path }));
                 return group;
             }
             default:
@@ -357,6 +381,8 @@ export class SceneGraph {
         this.repeats.delete(path);
         object.removeFromParent();
         entry.aim?.removeFromParent();
+        // A mesh's map (G3.7c) is freed with its texture's bitmap before the material
+        this.maps.release(path);
         if (object instanceof Mesh) {
             (object.geometry as BufferGeometry).dispose();
             disposeMaterial(object.material as Material);
@@ -460,6 +486,8 @@ export class SceneGraph {
                 old.dispose();
             } else if (name === 'material') {
                 applyMaterial(object.material as MeshStandardMaterial, materialParams(value, this.resolve), this.convert);
+                // G3.7c: the map's file is read once; the same file again (a colour change, a restyle) keeps its texture
+                this.maps.set(tree.path, tree.kind, value, object.material as MeshStandardMaterial);
             } else if (name === 'castShadow' || name === 'receiveShadow') {
                 // Drawn once a light has `shadows` (the renderer's shadow map is turned on then)
                 object[name] = value === true;
