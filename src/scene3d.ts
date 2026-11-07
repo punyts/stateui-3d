@@ -1,9 +1,12 @@
 import { Box3, OrthographicCamera, PerspectiveCamera, Raycaster, Vector2, Vector3 } from 'three';
 import type { Camera, Object3D } from 'three';
 import { DEFAULT_FOV, activeCamera, frameBounds, orthographicHeight } from './cameras.js';
+import { controlsMode, createCameraControls } from './controls.js';
+import type { CameraMove, CameraView } from './controls.js';
 import { createColorConverter } from './materials.js';
 import { createRenderer } from './renderer.js';
 import { SceneGraph, cameraTarget } from './scene.js';
+import type { ReadSceneFile, Scene3dIssue } from './scene.js';
 import type { Bounds3d, ColorResolver, JsonValue, Scene3dSettings, Scene3dTree, Vector3Tuple } from './tree.js';
 
 /** What a scene is made with */
@@ -25,6 +28,23 @@ export interface Scene3dOptions {
      * still draws, with `pending`)
      */
     readonly onStatus?: (status: Scene3dStatus) => void;
+    /**
+     * Told the active camera node's new `position` and `target` (in its parent's space) once when an orbit or pan
+     * gesture that moved it ends (G3.8b): the feeder writes them, so a reload keeps the view. Never told during a gesture
+     */
+    readonly onCamera?: (move: CameraMove) => void;
+    /**
+     * The element that is focusable while the scene has `controls` and whose arrow, `+` and `-` keys move the camera
+     * (G3.8b); default the host. The `scene3d` component passes its labelled scene box
+     */
+    readonly keyTarget?: Element;
+    /**
+     * Reads the bytes of a stored file by its id, for a `model`'s `src` (G3.7b): the `scene3d` component reads them
+     * through the host (`ui-file-read`). Without it a model with a file is told to `onIssue` as `file` `offline`
+     */
+    readonly readFile?: ReadSceneFile;
+    /** Told when a node cannot draw (`Scene3dIssue`: a model's file or its bytes); the other nodes draw */
+    readonly onIssue?: (issue: Scene3dIssue) => void;
 }
 
 /** What `onStatus` of the scene's options is told (see there) */
@@ -45,6 +65,8 @@ export interface Scene3dInfo {
     readonly contextLost: boolean;
     /** The environment preset drawn (`none`, `studio`, `daylight`, `neutral`) */
     readonly environment: string | undefined;
+    /** The `model` nodes whose file is being read or parsed, and those drawn */
+    readonly models: { readonly loading: number; readonly loaded: number };
 }
 
 /**
@@ -81,8 +103,9 @@ export interface Scene3d {
     readonly reducedMotion: boolean;
     /**
      * Resolves once the last `update` is on screen: after the frame it asked for, at once when none is waiting. While
-     * the WebGL context is lost it waits for the frame after the restore. A feeder marks itself ready then (the scene
-     * host's `data-render`). Resolves at once after `dispose`
+     * the WebGL context is lost it waits for the frame after the restore, and while a `model`'s file is read or parsed
+     * it waits for the frame after the last one has loaded or failed (G3.7b). A feeder marks itself ready then (the
+     * scene host's `data-render`). Resolves at once after `dispose`
      */
     drawn(): Promise<void>;
     /**
@@ -105,8 +128,8 @@ function shown(object: Object3D | null, root: Object3D): boolean {
 
 /**
  * Makes a scene in `host`: a canvas that follows the host's size (`ResizeObserver`), a `WebGLRenderer` (`renderer.ts`)
- * and a three.js scene built from the node trees given to `update` (`scene.ts`: `camera`, `light`, `mesh`, `group3d`;
- * a `model` is an empty group until G3.7b). It draws through the active camera (`activeCamera`: the first `camera` with
+ * and a three.js scene built from the node trees given to `update` (`scene.ts`: `camera`, `light`, `mesh`, `group3d`,
+ * and `model`, whose GLB file it reads with `readFile` and parses with no URL, `models.ts`). It draws through the active camera (`activeCamera`: the first `camera` with
  * `active: true`, else the first one), or, with none, a default perspective camera that frames the bounds of what is
  * drawn (`frameBounds`). Switching the active camera, the environment preset or the fog makes no node again.
  *
@@ -114,14 +137,24 @@ function shown(object: Object3D | null, root: Object3D): boolean {
  * nothing is scheduled at rest. The first light with `shadows` turns the renderer's shadow map on, once. On a lost
  * WebGL context it stops drawing; on its restore it draws the tree it holds again; when the context is not back within
  * `CONTEXT_RESTORE_TIMEOUT` it tells `onStatus` `failed`. Throws a `Scene3dError` (`no_webgl`) when the browser gives
- * no WebGL context; the caller shows its fallback then
+ * no WebGL context; the caller shows its fallback then.
+ *
+ * With `controls` `orbit` or `pan` in the settings (G3.8b, `controls.ts`), a pointer drag, the wheel and the keys of
+ * `keyTarget` move the camera in the renderer on every frame of the gesture (each frame tells `onStatus` `pending`),
+ * and the active camera node's `position` and `target` go to `onCamera` once when the gesture ends. With `none` (the
+ * default) the scene takes no pointer, wheel or key input
  */
 export function createScene3d(host: Element, options: Scene3dOptions = {}): Scene3d {
     const view = host.ownerDocument.defaultView;
     const renderer = createRenderer(host);
     const { canvas, webgl } = renderer;
     const resolve = options.resolveColor ?? literalColors;
-    const graph = new SceneGraph(resolve, createColorConverter(host.ownerDocument));
+    // A model that settles draws again; `drawn()` waits until no model is loading
+    const graph = new SceneGraph(resolve, createColorConverter(host.ownerDocument), {
+        readFile: options.readFile,
+        onIssue: options.onIssue,
+        onSettled: () => invalidate()
+    });
     const defaultCamera = new PerspectiveCamera(DEFAULT_FOV, 1, 0.1, 1000);
     const raycaster = new Raycaster();
     let reducedMotion = options.reducedMotion ?? false;
@@ -149,20 +182,41 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         return target;
     }
 
-    /** The camera to draw through, set to the canvas's aspect ratio */
+    /** The camera to draw through, set to the canvas's aspect ratio: the controls' own while they hold the camera (G3.8b) */
     function currentCamera(): Camera {
+        return controls.camera(aspect()) ?? treeCamera().camera;
+    }
+
+    /** How the tree's camera draws (the controls take it from here when a gesture starts) */
+    function cameraView(): CameraView {
+        const { camera, target, fov, node } = treeCamera();
+        const object = node === undefined ? undefined : graph.objectOf(node.path);
+        return {
+            position: camera.getWorldPosition(new Vector3()),
+            target,
+            fov,
+            near: camera.near,
+            far: camera.far,
+            orthographic: camera instanceof OrthographicCamera,
+            path: node?.path,
+            parent: object?.parent ?? null
+        };
+    }
+
+    /** The tree's camera, set to the canvas's aspect ratio, with its target in world space and its field of view */
+    function treeCamera(): { camera: PerspectiveCamera | OrthographicCamera; target: Vector3; fov: number; node?: Scene3dTree } {
         const node = activeCamera(graph.tree);
         const object = node === undefined ? undefined : graph.objectOf(node.path);
         graph.root.updateWorldMatrix(true, true);
+        const fov = typeof node?.properties.fov === 'number' ? node.properties.fov : DEFAULT_FOV;
         if (node !== undefined && object instanceof PerspectiveCamera) {
             object.aspect = aspect();
-            aim(object, node);
+            const target = aim(object, node);
             object.updateProjectionMatrix();
-            return object;
+            return { camera: object, target, fov, node };
         }
         if (node !== undefined && object instanceof OrthographicCamera) {
             const target = aim(object, node);
-            const fov = typeof node.properties.fov === 'number' ? node.properties.fov : DEFAULT_FOV;
             const height = orthographicHeight(object.getWorldPosition(new Vector3()).distanceTo(target), fov);
             const width = height * aspect();
             object.left = -width / 2;
@@ -170,7 +224,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             object.top = height / 2;
             object.bottom = -height / 2;
             object.updateProjectionMatrix();
-            return object;
+            return { camera: object, target, fov, node };
         }
         const box = new Box3().setFromObject(graph.root);
         const bounds = box.isEmpty() ? undefined : { min: box.min.toArray() as Vector3Tuple, max: box.max.toArray() as Vector3Tuple };
@@ -182,7 +236,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         defaultCamera.lookAt(...view.target);
         defaultCamera.updateProjectionMatrix();
         defaultCamera.updateMatrixWorld(true);
-        return defaultCamera;
+        return { camera: defaultCamera, target: new Vector3(...view.target), fov: DEFAULT_FOV };
     }
 
     function paint(): void {
@@ -199,6 +253,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             graph.recompile();
         }
         webgl.render(graph.scene, currentCamera());
+        // The models being loaded are not on screen yet: waiting goes on until the frame after the last one settles
+        if (graph.loadingModels > 0) return;
         const done = waiting;
         waiting = [];
         for (const settle of done) settle();
@@ -266,6 +322,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     observer?.observe(host);
     canvas.addEventListener('webglcontextlost', onContextLost);
     canvas.addEventListener('webglcontextrestored', onContextRestored);
+    // Orbit and pan (G3.8b): a gesture's frames are frames the feeder did not ask for, and it writes when it ends
+    const controls = createCameraControls({ canvas, keyTarget: options.keyTarget ?? host, view: cameraView, draw: invalidateByItself, onCamera: options.onCamera });
     resize(host.clientWidth, host.clientHeight, false);
 
     return {
@@ -273,6 +331,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             if (disposed) return;
             graph.sync(tree);
             if (settings !== undefined) graph.applySettings(settings);
+            if (settings !== undefined) controls.setMode(controlsMode(settings.controls));
+            controls.treeChanged(activeCamera(graph.tree));
             invalidate();
         },
         hit(x, y) {
@@ -312,7 +372,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
                 programs: programs?.length ?? 0,
                 shadowMap: webgl.shadowMap.enabled,
                 contextLost: lost,
-                environment: graph.environmentPreset
+                environment: graph.environmentPreset,
+                models: { loading: graph.loadingModels, loaded: graph.loadedModels }
             };
         },
         setReducedMotion(reduced) {
@@ -322,7 +383,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             return reducedMotion;
         },
         drawn() {
-            if (disposed || (frame === undefined && !lost)) return Promise.resolve();
+            if (disposed || (frame === undefined && !lost && graph.loadingModels === 0)) return Promise.resolve();
             return new Promise((settle) => waiting.push(settle));
         },
         dispose() {
@@ -339,6 +400,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             // Before the renderer forces its context loss, which would otherwise be taken for one to wait out
             canvas.removeEventListener('webglcontextlost', onContextLost);
             canvas.removeEventListener('webglcontextrestored', onContextRestored);
+            controls.dispose();
             graph.clear();
             renderer.dispose();
         }

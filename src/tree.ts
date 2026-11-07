@@ -40,6 +40,8 @@ export interface Scene3dSettings {
     readonly ambient?: JsonValue;
     readonly environment?: JsonValue;
     readonly fog?: JsonValue;
+    /** How a person moves the camera (G3.8b, `controls.ts`): `none` (the default), `orbit` or `pan` */
+    readonly controls?: JsonValue;
 }
 
 /**

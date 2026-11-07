@@ -5,6 +5,7 @@ import { environmentPreset, fogParams } from './environment.js';
 import type { EnvironmentLight, EnvironmentName } from './environment.js';
 import { createGeometry, geometryParams } from './geometries.js';
 import { applyMaterial, materialParams } from './materials.js';
+import { ModelError, disposeModel, parseModel } from './models.js';
 import type { ColorResolver, JsonValue, Scene3dSettings, Scene3dTree } from './tree.js';
 import { DEFAULT_FOV } from './cameras.js';
 
@@ -22,6 +23,54 @@ export const CAMERA_FAR = 2000;
 
 /** The properties whose change makes a node's object again: a light or camera of another `kind` is another class */
 const REBUILT_BY: Partial<Record<Scene3dTree['kind'], readonly string[]>> = { light: ['kind'], camera: ['kind'] };
+
+/**
+ * Something a node cannot draw, told to the feeder (`onIssue` of the scene's options), which reports it: `file` when a
+ * `model`'s file cannot be had (its `src` is empty or not a file reference, `no_file`; or the read failed, with the
+ * read's code: `not_found`, `offline`, ...), the feeder's `SUI-RUN-FILE`; `model` when the file's bytes cannot be drawn
+ * (a `ModelError`: `not_glb`, `draco`, `meshopt`, `ktx2`, `external_uri` or `invalid_glb`, followed by what in the file
+ * it is about), the feeder's `SUI-RUN-3D`. The other nodes draw
+ */
+export interface Scene3dIssue {
+    readonly kind: 'file' | 'model';
+    /** The state path of the node */
+    readonly path: string;
+    readonly reason: string;
+}
+
+/**
+ * Reads a stored file's bytes by its id (the `id` of a file reference, `{ id, name, size, type }`). The `scene3d`
+ * component reads them through the host (`ui-file-read`), as the chunk has no access to the store or the host. Rejects
+ * with an object whose `code` names the failure (`not_found`, `offline`, ...); the signal aborts a read no longer wanted
+ */
+export type ReadSceneFile = (id: string, signal: AbortSignal) => Promise<ArrayBuffer>;
+
+/** How the graph reads the models' files and what it tells about them */
+export interface ModelHooks {
+    /** Reads a model's file; without it every model with a file is a `file` issue `offline` */
+    readonly readFile?: ReadSceneFile;
+    readonly onIssue?: (issue: Scene3dIssue) => void;
+    /** A model finished loading, or failed: the scene draws again (and stops waiting for it) */
+    readonly onSettled?: () => void;
+}
+
+/** A model read or drawn: the id of its file, the abort of its read and, once parsed, its object */
+interface ModelLoad {
+    readonly id: string;
+    readonly abort: AbortController;
+    content?: Object3D;
+    done: boolean;
+}
+
+/** The id of a file reference, or undefined when the value is none */
+const fileIdOf = (value: JsonValue | undefined): string | undefined =>
+    typeof value === 'object' && value !== null && !Array.isArray(value) && typeof value.id === 'string' && value.id !== '' ? value.id : undefined;
+
+/** The code of a failed file read: its own `code` when it has one, else `internal` */
+const readCode = (error: unknown): string => {
+    const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
+    return typeof code === 'string' && code !== '' ? code : 'internal';
+};
 
 /** A node drawn in the scene: its tree, its object and, for a directional or spot light, the object it aims at */
 interface Entry {
@@ -58,10 +107,13 @@ export class SceneGraph {
     private settings: Scene3dSettings = {};
     /** One fog object while the scene has fog: a new one would make three.js compile every program again */
     private fog: Fog | undefined;
+    /** The model of each `model` node that has a file, by the node's path */
+    private readonly models = new Map<string, ModelLoad>();
 
     constructor(
         private readonly resolve: ColorResolver,
-        private readonly convert: (css: string) => Color | undefined
+        private readonly convert: (css: string) => Color | undefined,
+        private readonly hooks: ModelHooks = {}
     ) {
         this.scene.add(this.root, this.environment);
     }
@@ -84,6 +136,20 @@ export class SceneGraph {
     /** The environment preset drawn now (undefined before the first settings) */
     get environmentPreset(): EnvironmentName | undefined {
         return this.environmentName;
+    }
+
+    /** The models whose file is being read or parsed: the scene's `drawn()` waits for them */
+    get loadingModels(): number {
+        let loading = 0;
+        for (const load of this.models.values()) if (!load.done) loading += 1;
+        return loading;
+    }
+
+    /** The models drawn */
+    get loadedModels(): number {
+        let loaded = 0;
+        for (const load of this.models.values()) if (load.content !== undefined) loaded += 1;
+        return loaded;
     }
 
     /** True while a `light` node casts shadows: the renderer turns its shadow map on then (once) */
@@ -181,11 +247,12 @@ export class SceneGraph {
         }
     }
 
-    /** Marks every mesh's material to be compiled again (after the renderer's shadow map was turned on) */
+    /** Marks every mesh's material to be compiled again (after the renderer's shadow map was turned on), a model's too */
     recompile(): void {
-        for (const { object } of this.entries.values()) {
-            if (object instanceof Mesh) (object.material as Material).needsUpdate = true;
-        }
+        this.root.traverse((object) => {
+            if (!(object instanceof Mesh)) return;
+            for (const material of Array.isArray(object.material) ? (object.material as Material[]) : [object.material as Material]) material.needsUpdate = true;
+        });
     }
 
     /** Frees every node's geometry, material and texture and the environment's lights, and forgets the nodes */
@@ -219,7 +286,7 @@ export class SceneGraph {
         this.entries.set(tree.path, entry);
         object.userData.tree = tree;
         object.userData.path = tree.path;
-        const names = new Set([...Object.keys(tree.properties), 'position', 'rotation', 'scale', 'visible', 'geometry', 'material', 'color', 'intensity', 'target', 'fov']);
+        const names = new Set([...Object.keys(tree.properties), 'position', 'rotation', 'scale', 'visible', 'geometry', 'material', 'color', 'intensity', 'target', 'fov', 'src']);
         for (const name of names) this.apply(entry, name);
     }
 
@@ -227,7 +294,7 @@ export class SceneGraph {
         switch (tree.kind) {
             case 'group3d':
             case 'model':
-                // A model draws nothing yet: its GLB file is read and drawn by G3.7b; its transforms already apply
+                // A model's GLB file (its `src`) is read, parsed and drawn inside this group by `loadModel`
                 return new Group();
             case 'mesh':
                 // The geometry and the material are set by apply, as every property is
@@ -247,6 +314,7 @@ export class SceneGraph {
         if (entry === undefined) return;
         this.entries.delete(path);
         const { object } = entry;
+        this.unloadModel(path);
         object.removeFromParent();
         entry.aim?.removeFromParent();
         if (object instanceof Mesh) {
@@ -255,6 +323,65 @@ export class SceneGraph {
         }
         // A light frees its shadow map
         if (isLight(object)) object.dispose();
+    }
+
+    /**
+     * Reads and draws the GLB file of a `model` node's `src` (G3.7b): its bytes are read with the feeder's `readFile`,
+     * parsed (`parseModel`: no URL, images decoded to `ImageBitmap`s) and the model is added to the node's group as it
+     * is, so the node's `position`, `rotation` and `scale` place it. The same file again changes nothing; another file,
+     * or none, frees the model drawn before (and aborts a read under way). An empty `src`, a failed read and a model
+     * that cannot be drawn are told to `onIssue`, and the node draws nothing
+     */
+    private loadModel(entry: Entry): void {
+        const { path } = entry.tree;
+        const id = fileIdOf(entry.tree.properties.src);
+        const current = this.models.get(path);
+        if (current !== undefined && id !== undefined && current.id === id) return;
+        this.unloadModel(path);
+        const { readFile, onIssue, onSettled } = this.hooks;
+        if (id === undefined || readFile === undefined) {
+            onIssue?.({ kind: 'file', path, reason: id === undefined ? 'no_file' : 'offline' });
+            return;
+        }
+        const load: ModelLoad = { id, abort: new AbortController(), done: false };
+        this.models.set(path, load);
+        const wanted = (): boolean => !load.abort.signal.aborted && this.models.get(path) === load;
+        const settle = (issue?: Scene3dIssue): void => {
+            if (issue !== undefined) onIssue?.(issue);
+            load.done = true;
+            onSettled?.();
+        };
+        new Promise<ArrayBuffer>((resolve) => resolve(readFile(id, load.abort.signal))).then(
+            (data) =>
+                parseModel(data).then(
+                    (model) => {
+                        if (!wanted()) {
+                            disposeModel(model);
+                            return;
+                        }
+                        load.content = model;
+                        this.entries.get(path)?.object.add(model);
+                        settle();
+                    },
+                    (error: unknown) => {
+                        if (!wanted()) return;
+                        const reason = error instanceof ModelError ? error.message : `invalid_glb: ${error instanceof Error ? error.message : String(error)}`;
+                        settle({ kind: 'model', path, reason });
+                    }
+                ),
+            (error: unknown) => {
+                if (wanted()) settle({ kind: 'file', path, reason: readCode(error) });
+            }
+        );
+    }
+
+    /** Stops the read of a node's model and frees the model it drew */
+    private unloadModel(path: string): void {
+        const load = this.models.get(path);
+        if (load === undefined) return;
+        this.models.delete(path);
+        load.abort.abort();
+        if (load.content !== undefined) disposeModel(load.content);
     }
 
     /** Sets one property of a node on its object */
@@ -281,6 +408,10 @@ export class SceneGraph {
                 // `hidden` is the property every component has: a hidden node is not drawn, as one with `visible: false`
                 object.visible = tree.properties.visible !== false && tree.properties.hidden !== true;
                 return;
+        }
+        if (tree.kind === 'model') {
+            if (name === 'src') this.loadModel(entry);
+            return;
         }
         if (object instanceof Mesh) {
             if (name === 'geometry') {
