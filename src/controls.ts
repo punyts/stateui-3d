@@ -101,6 +101,11 @@ export interface CameraControlsHost {
     draw(): void;
     /** Told the active camera's new `position` and `target` when a gesture that moved it ends; the feeder writes them */
     readonly onCamera?: (move: CameraMove) => void;
+    /**
+     * Told when a gesture starts, before the controls read the tree's camera (G3.9): the scene ends a `transition` of the
+     * camera at once then, so the gesture starts from where the camera goes and nothing tweens against it
+     */
+    readonly onGestureStart?: () => void;
 }
 
 /** The orbit and pan controls of a scene */
@@ -113,6 +118,14 @@ export interface CameraControls {
     treeChanged(camera: Scene3dTree | undefined): void;
     /** The camera to draw through while the controls hold the camera (from a gesture until the state's camera changes); else undefined */
     camera(aspect: number): Camera | undefined;
+    /** True while a gesture is under way (a pointer drag, the wheel before it is idle, keys held) */
+    readonly gesturing: boolean;
+    /**
+     * Where the controls hold the active camera node, in its parent's space, while they hold it after a gesture (G3.9:
+     * a state write of the camera then tweens from this view, not from the camera the tree had before the gesture);
+     * undefined while the tree's camera draws, during a gesture, and for the default camera
+     */
+    holding(): CameraMove | undefined;
     dispose(): void;
 }
 
@@ -170,8 +183,15 @@ export function createCameraControls(host: CameraControlsHost): CameraControls {
         rig.updateMatrixWorld(true);
     };
 
+    /** A point in the space of the parent of the tree's camera node, cleaned of the noise of the matrix maths */
+    const local = (view: CameraView, point: Vector3): Vector3Tuple => {
+        const value = view.parent ? view.parent.worldToLocal(point.clone()) : point.clone();
+        return [clean(value.x), clean(value.y), clean(value.z)];
+    };
+
     const gestureHooks = {
         begin(): void {
+            host.onGestureStart?.();
             const before = held !== undefined;
             if (held === undefined) {
                 const view = host.view();
@@ -191,11 +211,7 @@ export function createCameraControls(host: CameraControlsHost): CameraControls {
             if (start !== undefined && start.position.equals(rig.position) && start.target.equals(target())) return;
             const view = host.view();
             if (view.path === undefined || host.onCamera === undefined) return;
-            const local = (point: Vector3): Vector3Tuple => {
-                const value = view.parent ? view.parent.worldToLocal(point.clone()) : point.clone();
-                return [clean(value.x), clean(value.y), clean(value.z)];
-            };
-            host.onCamera({ path: view.path, position: local(rig.position), target: local(target()) });
+            host.onCamera({ path: view.path, position: local(view, rig.position), target: local(view, target()) });
         },
         restore(): void {
             const start = snapshot;
@@ -356,6 +372,15 @@ export function createCameraControls(host: CameraControlsHost): CameraControls {
             rig.updateProjectionMatrix();
             rig.updateMatrixWorld(true);
             return rig;
+        },
+        get gesturing() {
+            return gestures?.active !== undefined;
+        },
+        holding() {
+            if (held === undefined || gestures?.active !== undefined) return undefined;
+            const view = host.view();
+            if (view.path === undefined) return undefined;
+            return { path: view.path, position: local(view, rig.position), target: local(view, target()) };
         },
         dispose() {
             stop();

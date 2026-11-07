@@ -63,12 +63,15 @@ export function applyMaterial(material: MeshStandardMaterial, params: MaterialPa
     material.emissive.copy((params.emissive === undefined ? undefined : convert(params.emissive)) ?? new Color(0x000000));
 }
 
-const SIMPLE_COLOR = /^(#[0-9a-f]{3}|#[0-9a-f]{6}|rgba?\([^)]*\)|hsla?\([^)]*\)|[a-z]+)$/i;
+/** How many colours a converter remembers before it forgets them all */
+const MAX_KNOWN_COLORS = 512;
+
+const SIMPLE_COLOR =/^(#[0-9a-f]{3}|#[0-9a-f]{6}|rgba?\([^)]*\)|hsla?\([^)]*\)|[a-z]+)$/i;
 
 /**
  * Turns CSS colours into three.js colours (in its linear working space; the alpha is dropped). Hex, `rgb()`, `hsl()`
  * and names are parsed by three.js; any other form a theme may hold (`oklch()`, `color-mix()`, `#rrggbbaa`) is drawn
- * once on a 1 by 1 canvas of `doc` and read back. Gives undefined for a value that is no colour. Remembers each answer
+ * once on a 1 by 1 canvas of `doc` and read back. Gives undefined for a value that is no colour. Remembers the last answers
  */
 export function createColorConverter(doc: Document | undefined): (css: string) => Color | undefined {
     const known = new Map<string, Color | undefined>();
@@ -109,6 +112,8 @@ export function createColorConverter(doc: Document | undefined): (css: string) =
         } else {
             colour = viaCanvas(value);
         }
+        // A transition gives a colour per frame (G3.9): the memory is kept small
+        if (known.size >= MAX_KNOWN_COLORS) known.clear();
         known.set(value, colour);
         return colour?.clone();
     };

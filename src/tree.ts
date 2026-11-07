@@ -21,9 +21,13 @@ export interface Scene3dTree {
     readonly path: string;
     /** The resolved properties of the node, links followed; the reserved keys and the node slots are not among them */
     readonly properties: Readonly<Record<string, JsonValue>>;
-    /** The nodes of a `group3d`'s `children`, in the order of the map; empty for every other kind */
+    /**
+     * The nodes of a `group3d`'s `children`, in the order of the map. For a `repeat3d`, its copies in record order, as
+     * the feeder bound them (`mesh` trees keyed by record key, at `<repeat>.rows.<recordKey>`, G3.6): drawn as one
+     * instanced mesh. Empty for every other kind
+     */
     readonly children: readonly Scene3dTree[];
-    /** The row template of a `repeat3d` */
+    /** The row template of a `repeat3d` (optional: the scene draws the copies in `children`) */
     readonly row?: Scene3dTree;
 }
 

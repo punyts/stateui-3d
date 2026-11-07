@@ -23,8 +23,14 @@ export type { ReadSceneFile, Scene3dIssue } from './scene.js';
 export { GLB_MAGIC, decodeDataUri, decodeGlb, encodeGlb, inspectGlb, isDataUri } from './glb.js';
 export type { GlbInspection, GltfJson, ModelRefusal, ModelRefusalCode } from './glb.js';
 export { BITMAP_IMAGES_PLUGIN, BITMAP_OPTIONS, ModelError, bitmapImages, disposeModel, parseModel } from './models.js';
+export { INSTANCE_CAP, InstanceLayout, MAX_UPDATE_RANGES, MIN_INSTANCE_CAPACITY, RepeatInstances, SHARED_ROW_PROPERTIES, instanceCapacity, instanceMatrix, instanceValues } from './instances.js';
+export type { InstanceChanges, InstanceValues } from './instances.js';
 export { NODE3D_KINDS, isNode3dKind } from './tree.js';
 export type { Bounds3d, ColorResolver, JsonValue, Node3dKind, Scene3dSettings, Scene3dTree, Vector3Tuple } from './tree.js';
+export { DEFAULT_DURATIONS, DEFAULT_EASINGS, REDUCED_MOTION_PROPERTY, createScheduler, cubicBezier, durationToken, easingToken, interpolate, isReducedMotion, parseCubicBezier, parseDuration, parseEasing } from './scheduler.js';
+export type { Easing, FrameTask, ReadToken, Scheduler, SchedulerHost, Timing, TweenValue } from './scheduler.js';
+export { TWEENED_CHANNELS, createMotion3d, formatRgb, timingOf } from './motion.js';
+export type { Motion3d, Motion3dOptions, Rgb } from './motion.js';
 export { VERSION } from './version.js';
 
 /** The name of the one global the runtime chunk sets on the page */

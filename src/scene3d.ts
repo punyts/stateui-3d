@@ -1,18 +1,34 @@
-import { Box3, OrthographicCamera, PerspectiveCamera, Raycaster, Vector2, Vector3 } from 'three';
+import { Box3, OrthographicCamera, PerspectiveCamera, Raycaster, SRGBColorSpace, Vector2, Vector3 } from 'three';
 import type { Camera, Object3D } from 'three';
 import { DEFAULT_FOV, activeCamera, frameBounds, orthographicHeight } from './cameras.js';
 import { controlsMode, createCameraControls } from './controls.js';
 import type { CameraMove, CameraView } from './controls.js';
 import { createColorConverter } from './materials.js';
+import { createMotion3d } from './motion.js';
+import type { Rgb } from './motion.js';
 import { createRenderer } from './renderer.js';
+import { createScheduler } from './scheduler.js';
+import type { ReadToken } from './scheduler.js';
 import { SceneGraph, cameraTarget } from './scene.js';
+import type { InstanceLayout } from './instances.js';
 import type { ReadSceneFile, Scene3dIssue } from './scene.js';
 import type { Bounds3d, ColorResolver, JsonValue, Scene3dSettings, Scene3dTree, Vector3Tuple } from './tree.js';
 
 /** What a scene is made with */
 export interface Scene3dOptions {
-    /** True while motion is reduced (the theme's `motion.duration.base` resolves to a duration of zero); default false */
+    /**
+     * True while motion is reduced (the theme's `motion.duration.base` resolves to a duration of zero); default false.
+     * A `transition` then jumps (G3.9)
+     */
     readonly reducedMotion?: boolean;
+    /**
+     * Reads a custom property for the motion tokens a node's `transition` names (G3.9): `duration` `fast`, `base` or
+     * `slow` as `--ui-motion-duration-<name>` (in `ms` or `s`) and `easing` `standard`, `enter` or `exit` as
+     * `--ui-motion-easing-<name>` (a `cubic-bezier(...)`), read when a tween starts; an unset or unreadable one takes
+     * the shipped value (100, 200 and 400 ms; the shipped curves). Default: the host's computed style, so the theme of
+     * the page the scene is in applies
+     */
+    readonly readToken?: ReadToken;
     /**
      * Resolves a colour value (a literal or a token reference) to a CSS colour; the `scene3d` component passes the
      * component library's paint resolver reading the host's computed style (`--ui-…`). Without it a literal is used as it
@@ -67,6 +83,10 @@ export interface Scene3dInfo {
     readonly environment: string | undefined;
     /** The `model` nodes whose file is being read or parsed, and those drawn */
     readonly models: { readonly loading: number; readonly loaded: number };
+    /** The tweens of `transition` running (G3.9) */
+    readonly tweens: number;
+    /** The instances the `repeat3d` nodes draw (G3.6) */
+    readonly instances: number;
 }
 
 /**
@@ -82,10 +102,15 @@ export interface Scene3d {
     update(tree: readonly Scene3dTree[], settings?: Scene3dSettings): void;
     /**
      * The interactive node drawn at a point of the host, in CSS pixels from its top-left corner: the first node hit by
-     * the ray, or its nearest `interactive` ancestor; undefined when none is
+     * the ray, or its nearest `interactive` ancestor; undefined when none is. An instance of a `repeat3d` gives the copy
+     * its instance index draws (G3.6: `key` the record key, `path` `<repeat>.rows.<recordKey>`) when the copy is
+     * interactive, else the repeat or its nearest interactive ancestor
      */
     hit(x: number, y: number): Scene3dTree | undefined;
-    /** The bounds in scene units of the node with this state path, or undefined when it draws nothing */
+    /**
+     * The bounds in scene units of the node with this state path, or undefined when it draws nothing; a repeat copy's
+     * path (`<repeat>.rows.<recordKey>`) gives the bounds of its instance (G3.6)
+     */
     boundsOf(path: string): Bounds3d | undefined;
     /** The element that stands for a node (by its path), the proxy button of an interactive node; undefined when there is none */
     elementOf(path: string): Element | undefined;
@@ -118,6 +143,15 @@ export interface Scene3d {
 /** A colour resolver that takes a literal as it is and resolves no token */
 const literalColors: ColorResolver = (value: JsonValue) => (typeof value === 'string' && value.trim() !== '' && !value.trim().startsWith('{') ? value : undefined);
 
+/**
+ * The copy of a `repeat3d` that the instance a ray hit draws (G3.6): the instanced mesh knows its `InstanceLayout`, and
+ * the copy's `key` is the record key of the index. Undefined for anything that is not an instance
+ */
+function instanceCopy(object: Object3D, instanceId: number | undefined): Scene3dTree | undefined {
+    const layout = object.userData.layout as InstanceLayout | undefined;
+    return instanceId === undefined || layout === undefined ? undefined : layout.treeAt(instanceId);
+}
+
 /** True when the object and every ancestor up to the root are visible */
 function shown(object: Object3D | null, root: Object3D): boolean {
     for (let current = object; current && current !== root; current = current.parent) {
@@ -129,7 +163,8 @@ function shown(object: Object3D | null, root: Object3D): boolean {
 /**
  * Makes a scene in `host`: a canvas that follows the host's size (`ResizeObserver`), a `WebGLRenderer` (`renderer.ts`)
  * and a three.js scene built from the node trees given to `update` (`scene.ts`: `camera`, `light`, `mesh`, `group3d`,
- * and `model`, whose GLB file it reads with `readFile` and parses with no URL, `models.ts`). It draws through the active camera (`activeCamera`: the first `camera` with
+ * `model`, whose GLB file it reads with `readFile` and parses with no URL, `models.ts`, and `repeat3d`, whose copies
+ * it draws as one instanced mesh, `instances.ts`). It draws through the active camera (`activeCamera`: the first `camera` with
  * `active: true`, else the first one), or, with none, a default perspective camera that frames the bounds of what is
  * drawn (`frameBounds`). Switching the active camera, the environment preset or the fog makes no node again.
  *
@@ -142,7 +177,14 @@ function shown(object: Object3D | null, root: Object3D): boolean {
  * With `controls` `orbit` or `pan` in the settings (G3.8b, `controls.ts`), a pointer drag, the wheel and the keys of
  * `keyTarget` move the camera in the renderer on every frame of the gesture (each frame tells `onStatus` `pending`),
  * and the active camera node's `position` and `target` go to `onCamera` once when the gesture ends. With `none` (the
- * default) the scene takes no pointer, wheel or key input
+ * default) the scene takes no pointer, wheel or key input.
+ *
+ * A node with `transition` (G3.9, `motion.ts`) eases to the values a state change gives its `position`, `rotation`,
+ * `scale`, a mesh's `material.color` and `material.opacity`, a light's `intensity` and a camera's `target`, on the
+ * scene's scheduler (`scheduler.ts`): a frame per animation frame while a tween runs, none at rest, and `drawn()`
+ * waits until the last tween has ended. A new value mid-tween starts from where the node is. Reduced motion
+ * (`reducedMotion`, `setReducedMotion`) jumps every change and ends the running tweens. A gesture of the controls ends
+ * the camera's tween at once; the camera written during a gesture jumps, and the camera a gesture wrote is not tweened
  */
 export function createScene3d(host: Element, options: Scene3dOptions = {}): Scene3d {
     const view = host.ownerDocument.defaultView;
@@ -169,6 +211,49 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     let restyled = false;
     // The defaults of the scene's own properties (the `studio` environment) until the feeder gives its own
     graph.applySettings({});
+
+    // Transitions (G3.9): one scheduler per scene, idle when nothing moves; its frames draw the tree with the tweens
+    // where they are. Without a window there are no frames, so every change jumps
+    const motionColors = createColorConverter(host.ownerDocument);
+    const rgbOf = (value: JsonValue): Rgb | undefined => {
+        const css = resolve(value);
+        const colour = css === undefined ? undefined : motionColors(css);
+        if (colour === undefined) return undefined;
+        const { r, g, b } = colour.getRGB({ r: 0, g: 0, b: 0 }, SRGBColorSpace);
+        return [r * 255, g * 255, b * 255];
+    };
+    const readToken: ReadToken = options.readToken ?? ((name) => view?.getComputedStyle(host).getPropertyValue(name).trim() || undefined);
+    const scheduler = createScheduler({
+        requestFrame: view === null ? undefined : (callback) => view.requestAnimationFrame(callback),
+        cancelFrame: (handle) => view?.cancelAnimationFrame(handle),
+        onFrame: () => drawMotion()
+    });
+    scheduler.setReduced(reducedMotion || view === null);
+    const motion = createMotion3d({ scheduler, read: readToken, colorOf: rgbOf });
+    /** The active camera the state last gave (its path and properties), to tell a change of it from a tween's */
+    let stateCamera: string | undefined;
+
+    /** A frame of the scheduler: the tree with the tweens where they are now, drawn in this frame */
+    function drawMotion(): void {
+        if (disposed) return;
+        graph.sync(motion.current());
+        if (lost) return;
+        if (frame !== undefined) view?.cancelAnimationFrame(frame);
+        paint();
+    }
+
+    /**
+     * Before a tree is drawn (G3.9): when the state's camera changed while the controls hold the camera after a gesture,
+     * its tween starts from the view the controls show, not from the camera before the gesture
+     */
+    function cameraFromView(tree: readonly Scene3dTree[]): void {
+        const camera = activeCamera(tree);
+        const key = camera === undefined ? '' : JSON.stringify([camera.path, camera.properties]);
+        if (key === stateCamera) return;
+        stateCamera = key;
+        const hold = controls.holding();
+        if (hold !== undefined && hold.path === camera?.path) motion.settle(hold.path, { position: [...hold.position], target: [...hold.target] });
+    }
 
     const aspect = (): number => renderer.size.width / renderer.size.height;
 
@@ -253,8 +338,9 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             graph.recompile();
         }
         webgl.render(graph.scene, currentCamera());
-        // The models being loaded are not on screen yet: waiting goes on until the frame after the last one settles
-        if (graph.loadingModels > 0) return;
+        // The models being loaded are not on screen yet: waiting goes on until the frame after the last one settles, and
+        // while a transition runs until the frame it ends in (G3.9)
+        if (graph.loadingModels > 0 || motion.running > 0) return;
         const done = waiting;
         waiting = [];
         for (const settle of done) settle();
@@ -323,16 +409,36 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     canvas.addEventListener('webglcontextlost', onContextLost);
     canvas.addEventListener('webglcontextrestored', onContextRestored);
     // Orbit and pan (G3.8b): a gesture's frames are frames the feeder did not ask for, and it writes when it ends
-    const controls = createCameraControls({ canvas, keyTarget: options.keyTarget ?? host, view: cameraView, draw: invalidateByItself, onCamera: options.onCamera });
+    const controls = createCameraControls({
+        canvas,
+        keyTarget: options.keyTarget ?? host,
+        view: cameraView,
+        draw: invalidateByItself,
+        // G3.9: the camera a gesture writes comes back as state and is shown at once, never tweened back from where it was
+        onCamera:
+            options.onCamera === undefined
+                ? undefined
+                : (move) => {
+                      motion.settle(move.path, { position: [...move.position], target: [...move.target] });
+                      options.onCamera?.(move);
+                  },
+        // G3.9: a gesture ends the camera's transition at once and starts from where the camera goes
+        onGestureStart: () => {
+            if (motion.finish((node) => node.kind === 'camera')) graph.sync(motion.current());
+        }
+    });
     resize(host.clientWidth, host.clientHeight, false);
 
     return {
         update(tree, settings) {
             if (disposed) return;
-            graph.sync(tree);
+            // G3.9: the changes of nodes with `transition` tween; the camera the controls hold during a gesture jumps
+            cameraFromView(tree);
+            graph.sync(motion.apply(tree, (node) => node.kind === 'camera' && controls.gesturing));
             if (settings !== undefined) graph.applySettings(settings);
             if (settings !== undefined) controls.setMode(controlsMode(settings.controls));
-            controls.treeChanged(activeCamera(graph.tree));
+            // The state's camera, not one a transition is moving
+            controls.treeChanged(activeCamera(tree));
             invalidate();
         },
         hit(x, y) {
@@ -341,6 +447,9 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             raycaster.setFromCamera(new Vector2((x / width) * 2 - 1, -(y / height) * 2 + 1), currentCamera());
             for (const intersection of raycaster.intersectObject(graph.root, true)) {
                 if (!shown(intersection.object, graph.root)) continue;
+                // An instance of a repeat3d (G3.6): the copy its index draws, whose key is its record key
+                const copy = instanceCopy(intersection.object, intersection.instanceId);
+                if (copy?.properties.interactive === true) return copy;
                 for (let object: Object3D | null = intersection.object; object && object !== graph.root; object = object.parent) {
                     const tree = object.userData.tree as Scene3dTree | undefined;
                     if (tree?.properties.interactive === true) return tree;
@@ -350,7 +459,11 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         },
         boundsOf(path) {
             const object = disposed ? undefined : graph.objectOf(path);
-            if (!object) return undefined;
+            if (!object) {
+                // A repeat copy's path (`<repeat>.rows.<recordKey>`, G3.6): the bounds of its instance
+                const instance = disposed ? undefined : graph.instanceBounds(path);
+                return instance === undefined || instance.isEmpty() ? undefined : { min: instance.min.toArray() as Vector3Tuple, max: instance.max.toArray() as Vector3Tuple };
+            }
             graph.root.updateWorldMatrix(true, true);
             const box = new Box3().setFromObject(object);
             if (box.isEmpty()) return undefined;
@@ -373,17 +486,22 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
                 shadowMap: webgl.shadowMap.enabled,
                 contextLost: lost,
                 environment: graph.environmentPreset,
-                models: { loading: graph.loadingModels, loaded: graph.loadedModels }
+                models: { loading: graph.loadingModels, loaded: graph.loadedModels },
+                tweens: motion.running,
+                instances: graph.instances
             };
         },
         setReducedMotion(reduced) {
-            if (!disposed) reducedMotion = reduced;
+            if (disposed) return;
+            reducedMotion = reduced;
+            // Turning it on ends every transition at its end value, drawn at once
+            scheduler.setReduced(reduced || view === null);
         },
         get reducedMotion() {
             return reducedMotion;
         },
         drawn() {
-            if (disposed || (frame === undefined && !lost && graph.loadingModels === 0)) return Promise.resolve();
+            if (disposed || (frame === undefined && !lost && graph.loadingModels === 0 && motion.running === 0)) return Promise.resolve();
             return new Promise((settle) => waiting.push(settle));
         },
         dispose() {
@@ -401,6 +519,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             canvas.removeEventListener('webglcontextlost', onContextLost);
             canvas.removeEventListener('webglcontextrestored', onContextRestored);
             controls.dispose();
+            scheduler.dispose();
+            motion.dispose();
             graph.clear();
             renderer.dispose();
         }

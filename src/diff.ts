@@ -16,12 +16,15 @@ export interface TreeDiff {
     readonly changed: ReadonlyMap<string, readonly string[]>;
 }
 
-/** The nodes of a tree by path, parents before their children, in the order of the tree */
+/**
+ * The nodes of a tree by path, parents before their children, in the order of the tree. A `repeat3d`'s `children` (its
+ * copies, one per record) are not nodes: the repeat draws them as instances and compares them itself (G3.6)
+ */
 export function flattenTree(trees: readonly Scene3dTree[], parent?: string, into = new Map<string, FlatNode>()): Map<string, FlatNode> {
     for (const tree of trees) {
         if (into.has(tree.path)) continue;
         into.set(tree.path, { tree, parent });
-        flattenTree(tree.children, tree.path, into);
+        if (tree.kind !== 'repeat3d') flattenTree(tree.children, tree.path, into);
     }
     return into;
 }

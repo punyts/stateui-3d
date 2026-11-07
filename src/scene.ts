@@ -1,11 +1,12 @@
 import { AmbientLight, Color, DirectionalLight, Fog, Group, HemisphereLight, MathUtils, Mesh, MeshStandardMaterial, OrthographicCamera, PerspectiveCamera, PointLight, Scene, SpotLight } from 'three';
-import type { BufferGeometry, Light, LightShadow, Material, Object3D, Texture } from 'three';
+import type { Box3, BufferGeometry, Light, LightShadow, Material, Object3D, Texture } from 'three';
 import { diffTrees, flattenTree } from './diff.js';
 import { environmentPreset, fogParams } from './environment.js';
 import type { EnvironmentLight, EnvironmentName } from './environment.js';
 import { createGeometry, geometryParams } from './geometries.js';
 import { applyMaterial, materialParams } from './materials.js';
 import { ModelError, disposeModel, parseModel } from './models.js';
+import { RepeatInstances } from './instances.js';
 import type { ColorResolver, JsonValue, Scene3dSettings, Scene3dTree } from './tree.js';
 import { DEFAULT_FOV } from './cameras.js';
 
@@ -109,6 +110,8 @@ export class SceneGraph {
     private fog: Fog | undefined;
     /** The model of each `model` node that has a file, by the node's path */
     private readonly models = new Map<string, ModelLoad>();
+    /** The instances of each `repeat3d` node (G3.6), by the node's path */
+    private readonly repeats = new Map<string, RepeatInstances>();
 
     constructor(
         private readonly resolve: ColorResolver,
@@ -150,6 +153,30 @@ export class SceneGraph {
         let loaded = 0;
         for (const load of this.models.values()) if (load.content !== undefined) loaded += 1;
         return loaded;
+    }
+
+    /** The instances of the `repeat3d` node with this path (G3.6) */
+    repeatOf(path: string): RepeatInstances | undefined {
+        return this.repeats.get(path);
+    }
+
+    /** The number of instances the `repeat3d` nodes draw */
+    get instances(): number {
+        let count = 0;
+        for (const repeat of this.repeats.values()) count += repeat.count;
+        return count;
+    }
+
+    /**
+     * The world bounds of the instance a repeat copy's path names (`<repeat>.rows.<recordKey>`, the path the binder gives
+     * a copy), or undefined when no repeat draws it
+     */
+    instanceBounds(path: string): Box3 | undefined {
+        for (const [repeatPath, repeat] of this.repeats) {
+            const prefix = `${repeatPath}.rows.`;
+            if (path.startsWith(prefix)) return repeat.boundsOf(path.slice(prefix.length));
+        }
+        return undefined;
     }
 
     /** True while a `light` node casts shadows: the renderer turns its shadow map on then (once) */
@@ -195,6 +222,10 @@ export class SceneGraph {
             const into = parent === undefined ? this.root : (this.entries.get(parent)?.object ?? this.root);
             if (entry.object.parent !== into) into.add(entry.object);
             if (entry.aim !== undefined && entry.aim.parent !== into) into.add(entry.aim);
+        }
+        // A repeat's copies are its instances, not nodes (`flattenTree` leaves them out): each repeat compares its own
+        for (const [path, { tree }] of next) {
+            if (tree.kind === 'repeat3d') this.repeats.get(path)?.sync(tree.children);
         }
         this.trees = trees;
     }
@@ -245,6 +276,7 @@ export class SceneGraph {
             if (entry.object instanceof Mesh) this.apply(entry, 'material');
             else if (isLight(entry.object)) this.apply(entry, 'color');
         }
+        for (const repeat of this.repeats.values()) repeat.restyle();
     }
 
     /** Marks every mesh's material to be compiled again (after the renderer's shadow map was turned on), a model's too */
@@ -303,8 +335,14 @@ export class SceneGraph {
                 return makeLight(tree.properties.kind);
             case 'camera':
                 return tree.properties.kind === 'orthographic' ? new OrthographicCamera(-1, 1, 1, -1, CAMERA_NEAR, CAMERA_FAR) : new PerspectiveCamera(DEFAULT_FOV, 1, CAMERA_NEAR, CAMERA_FAR);
+            case 'repeat3d': {
+                // The copies are drawn as one instanced mesh in this group (G3.6, `instances.ts`), synced after the nodes
+                const group = new Group();
+                this.repeats.set(tree.path, new RepeatInstances(group, this.resolve, this.convert));
+                return group;
+            }
             default:
-                // repeat3d and label3d draw with their own stories (G3.6, G3.6b)
+                // label3d draws with its own story (G3.6b)
                 return undefined;
         }
     }
@@ -315,6 +353,8 @@ export class SceneGraph {
         this.entries.delete(path);
         const { object } = entry;
         this.unloadModel(path);
+        this.repeats.get(path)?.dispose();
+        this.repeats.delete(path);
         object.removeFromParent();
         entry.aim?.removeFromParent();
         if (object instanceof Mesh) {
