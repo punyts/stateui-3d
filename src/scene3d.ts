@@ -6,6 +6,8 @@ import type { CameraMove, CameraView } from './controls.js';
 import { PressGesture, interactiveNodes, screenBox } from './interaction.js';
 import { createProxies } from './proxies.js';
 import { createColorConverter } from './materials.js';
+import { createAnimations3d } from './animate.js';
+import { ModelClips } from './clips.js';
 import { createMotion3d } from './motion.js';
 import type { Rgb } from './motion.js';
 import { createRenderer } from './renderer.js';
@@ -14,13 +16,14 @@ import type { ReadToken } from './scheduler.js';
 import { SceneGraph, cameraTarget } from './scene.js';
 import type { InstanceLayout } from './instances.js';
 import type { ReadSceneFile, Scene3dIssue } from './scene.js';
+import type { LabelHooks } from './labels.js';
 import type { Bounds3d, ColorResolver, JsonValue, Scene3dSettings, Scene3dTree, Vector3Tuple } from './tree.js';
 
 /** What a scene is made with */
 export interface Scene3dOptions {
     /**
      * True while motion is reduced (the theme's `motion.duration.base` resolves to a duration of zero); default false.
-     * A `transition` then jumps (G3.9)
+     * A `transition` then jumps (G3.9), and `animate` and a model's clip do not play (G3.9b)
      */
     readonly reducedMotion?: boolean;
     /**
@@ -69,6 +72,11 @@ export interface Scene3dOptions {
      * its element for the dispatcher, which runs the `on` entry of the node `shape` names
      */
     readonly onEvent?: (event: Scene3dEvent) => void;
+    /**
+     * Reads the font family a `label3d` draws its text in (G3.6b), when the labels are drawn and again on `restyle`.
+     * Default: the host's computed `font-family`, so the page font applies; unset or empty is `sans-serif`
+     */
+    readonly readFont?: () => string | undefined;
 }
 
 /**
@@ -107,8 +115,14 @@ export interface Scene3dInfo {
     readonly maps: { readonly loading: number; readonly loaded: number };
     /** The tweens of `transition` running (G3.9) */
     readonly tweens: number;
+    /** The nodes whose `animate` plays now (G3.9b) */
+    readonly animations: number;
+    /** The clips of `model` nodes playing now (G3.9b) */
+    readonly clips: number;
     /** The instances the `repeat3d` nodes draw (G3.6) */
     readonly instances: number;
+    /** The `label3d` nodes that draw a text (G3.6b) */
+    readonly labels: number;
 }
 
 /**
@@ -178,6 +192,16 @@ function instanceCopy(object: Object3D, instanceId: number | undefined): Scene3d
     return instanceId === undefined || layout === undefined ? undefined : layout.treeAt(instanceId);
 }
 
+/**
+ * How a scene's labels are drawn (G3.6b): canvases of the host's document, in the font `readFont` gives, else the
+ * host's computed `font-family` (the page font, as the theme sets it)
+ */
+function labelHooks(host: Element, options: Scene3dOptions): LabelHooks {
+    const doc = host.ownerDocument;
+    const view = doc.defaultView;
+    return { doc, readFont: options.readFont ?? (() => view?.getComputedStyle(host).fontFamily) };
+}
+
 /** A number without the noise of the matrix maths (the point of a press or a hover, G3.8) */
 const clean = (value: number): number => Math.round(value * 1e6) / 1e6 + 0;
 
@@ -209,6 +233,11 @@ function shown(object: Object3D | null, root: Object3D): boolean {
  * and the active camera node's `position` and `target` go to `onCamera` once when the gesture ends. With `none` (the
  * default) the scene takes no pointer, wheel or key input for the camera.
  *
+ * Labels (G3.6b, `labels.ts`): a `label3d` draws its `_text` with `fillText` on a canvas, in the page font (`readFont`)
+ * and its `color` or the settings' `labelColor`, as a sprite that faces the camera, its font `fontSize` scene units. The
+ * canvas is drawn again when the text, the font or the colour changes (`restyle` reads both again, and a web font that
+ * finishes loading draws every label again), and freed with the node.
+ *
  * Press and hover (G3.8, `interaction.ts` and `proxies.ts`): a primary pointer that goes down and up on the canvas
  * within `PRESS_SLOP` pixels, while the controls did not move the camera, is a `press` of the interactive node `hit`
  * finds under the release (a drag to rotate is never a press); nothing on empty space or on a node that is not
@@ -225,18 +254,35 @@ function shown(object: Object3D | null, root: Object3D): boolean {
  * waits until the last tween has ended. A new value mid-tween starts from where the node is. Reduced motion
  * (`reducedMotion`, `setReducedMotion`) jumps every change and ends the running tweens. A gesture of the controls ends
  * the camera's tween at once; the camera written during a gesture jumps, and the camera a gesture wrote is not tweened
+ *
+ * `animate` and clips (G3.9b, `animate.ts` and `clips.ts`): a node with `animate` plays `spin` (a turn about its y
+ * axis), `bob` (up `BOB_HEIGHT` and back) or `pulse` (`PULSE_GROWTH` larger and back) over its own values, drawn over
+ * any tween, in the scheduler's frames; a camera's and a `repeat3d` copy's `animate` do not play (the repeat's own moves
+ * every instance). A `model` plays the clip of its GLB that `animation` names (the file's first when unset) with an
+ * `AnimationMixer` while `playing` is true, looping; `playing: false` pauses it where it is, and a name the file does
+ * not have is told to `onIssue` (`model`, `unknown_clip`, naming the file's clips). The mixers move on only in a
+ * frame of the scheduler while a clip plays. Neither writes anything, neither makes `drawn()` wait (it resolves after
+ * the next frame), and a scene with no `animate` and no playing clip asks for no frame. Reduced motion rests every
+ * `animate` and shows each clip's first frame, still; turning it off plays both from their beginning
  */
 export function createScene3d(host: Element, options: Scene3dOptions = {}): Scene3d {
     const view = host.ownerDocument.defaultView;
     const renderer = createRenderer(host);
     const { canvas, webgl } = renderer;
     const resolve = options.resolveColor ?? literalColors;
+    // G3.9b: the clips of the models, played on the scheduler's frames while one plays
+    const clips = new ModelClips({ onIssue: options.onIssue });
     // A model that settles draws again; `drawn()` waits until no model is loading
     const graph = new SceneGraph(resolve, createColorConverter(host.ownerDocument), {
         readFile: options.readFile,
         onIssue: options.onIssue,
-        onSettled: () => invalidate()
-    });
+        onSettled: () => invalidate(),
+        // G3.9b: a model drawn or freed; a clip it plays asks for frames
+        onModel: (path, model) => {
+            clips.attach(path, model);
+            playClips();
+        }
+    }, labelHooks(host, options));
     const defaultCamera = new PerspectiveCamera(DEFAULT_FOV, 1, 0.1, 1000);
     const raycaster = new Raycaster();
     // Press and hover (G3.8): the proxy buttons of the interactive nodes, a pointer's press, the node the pointer is in
@@ -277,13 +323,32 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     });
     scheduler.setReduced(reducedMotion || view === null);
     const motion = createMotion3d({ scheduler, read: readToken, colorOf: rgbOf });
+    // G3.9b: `animate` on the same scheduler, drawn over the tweens of `transition`
+    const animations = createAnimations3d(scheduler);
+    clips.setReduced(reducedMotion || view === null);
+    /** The frame task that moves the clips on while one plays, and the scheduler time of its last frame */
+    let clipTask: (() => void) | undefined;
+    let clipTime: number | undefined;
+
+    /** Moves the playing clips on in each frame of the scheduler, asking for frames only while one plays (G3.9b) */
+    function playClips(): void {
+        if (disposed || clipTask !== undefined || clips.playing === 0) return;
+        clipTime = undefined;
+        clipTask = scheduler.request((now) => {
+            const seconds = clipTime === undefined ? 0 : Math.max(0, now - clipTime) / 1000;
+            clipTime = now;
+            if (clips.advance(seconds)) return true;
+            clipTask = undefined;
+            return false;
+        });
+    }
     /** The active camera the state last gave (its path and properties), to tell a change of it from a tween's */
     let stateCamera: string | undefined;
 
     /** A frame of the scheduler: the tree with the tweens where they are now, drawn in this frame */
     function drawMotion(): void {
         if (disposed) return;
-        graph.sync(motion.current());
+        graph.sync(animations.decorate(motion.current()));
         if (lost) return;
         if (frame !== undefined) view?.cancelAnimationFrame(frame);
         paint();
@@ -581,6 +646,14 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
               })
             : undefined;
     observer?.observe(host);
+    // G3.6b: a web font that finishes loading draws the labels again (the same family now has its own glyphs)
+    const fonts = (host.ownerDocument as Document & { fonts?: FontFaceSet }).fonts;
+    const onFontsLoaded = (): void => {
+        if (disposed || graph.labels.size === 0) return;
+        graph.labels.redraw();
+        invalidateByItself();
+    };
+    fonts?.addEventListener('loadingdone', onFontsLoaded);
     canvas.addEventListener('webglcontextlost', onContextLost);
     canvas.addEventListener('webglcontextrestored', onContextRestored);
     // Orbit and pan (G3.8b): a gesture's frames are frames the feeder did not ask for, and it writes when it ends
@@ -603,7 +676,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
                   },
         // G3.9: a gesture ends the camera's transition at once and starts from where the camera goes
         onGestureStart: () => {
-            if (motion.finish((node) => node.kind === 'camera')) graph.sync(motion.current());
+            if (motion.finish((node) => node.kind === 'camera')) graph.sync(animations.decorate(motion.current()));
         }
     });
     resize(host.clientWidth, host.clientHeight, false);
@@ -613,7 +686,10 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             if (disposed) return;
             // G3.9: the changes of nodes with `transition` tween; the camera the controls hold during a gesture jumps
             cameraFromView(tree);
-            graph.sync(motion.apply(tree, (node) => node.kind === 'camera' && controls.gesturing));
+            // G3.9b: `animate` over the tweens, and the models' clips
+            graph.sync(animations.follow(motion.apply(tree, (node) => node.kind === 'camera' && controls.gesturing)));
+            clips.follow(tree);
+            playClips();
             if (settings !== undefined) graph.applySettings(settings);
             if (settings !== undefined) controls.setMode(controlsMode(settings.controls));
             // The state's camera, not one a transition is moving
@@ -649,14 +725,24 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
                 models: { loading: graph.loadingModels, loaded: graph.loadedModels },
                 maps: { loading: graph.loadingMaps, loaded: graph.loadedMaps },
                 tweens: motion.running,
-                instances: graph.instances
+                animations: animations.playing,
+                clips: clips.playing,
+                instances: graph.instances,
+                labels: graph.labels.drawn
             };
         },
         setReducedMotion(reduced) {
             if (disposed) return;
             reducedMotion = reduced;
             // Turning it on ends every transition at its end value, drawn at once
-            scheduler.setReduced(reduced || view === null);
+            if (!scheduler.setReduced(reduced || view === null)) return;
+            // G3.9b: `animate` rests and the clips show their first frame; turned off, both play from their beginning
+            clips.setReduced(reduced || view === null);
+            clipTime = undefined;
+            if (!reduced) animations.restart();
+            graph.sync(animations.decorate(motion.current()));
+            playClips();
+            invalidate();
         },
         get reducedMotion() {
             return reducedMotion;
@@ -676,6 +762,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             waiting = [];
             for (const settle of done) settle();
             observer?.disconnect();
+            // G3.6b
+            fonts?.removeEventListener('loadingdone', onFontsLoaded);
             // Before the renderer forces its context loss, which would otherwise be taken for one to wait out
             canvas.removeEventListener('webglcontextlost', onContextLost);
             canvas.removeEventListener('webglcontextrestored', onContextRestored);
@@ -691,6 +779,9 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             controls.dispose();
             scheduler.dispose();
             motion.dispose();
+            // G3.9b
+            animations.dispose();
+            clips.dispose();
             graph.clear();
             renderer.dispose();
         }

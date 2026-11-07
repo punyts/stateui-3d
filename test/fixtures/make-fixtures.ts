@@ -2,10 +2,13 @@
 // top half red and the bottom half green, with an unlit material, so a pixel above the centre of the front face is red
 // and one below it green when the image is decoded the right way up. Run it with `node test/fixtures/make-fixtures.ts`
 // (Node's type stripping); the file it writes is committed beside it.
+//
+// It also makes `box-clips.glb` (G3.9b): the same box with two animation clips of one second each that move its node,
+// `slide` from x = 0 to x = 1 and `lift` from y = 0 to y = 1, both linear, so a clip's time shows in where the box is.
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { encodeGlb } from '../../src/glb.ts';
+import { decodeGlb, encodeGlb } from '../../src/glb.ts';
 
 /** The colours of the texture's top and bottom halves */
 export const TOP = [255, 0, 0] as const;
@@ -131,9 +134,54 @@ export function boxGlb(): ArrayBuffer {
     return encodeGlb(json, bin);
 }
 
+/** The clips of `box-clips.glb`, in the order of the file, and how far each moves the box along its axis in its second */
+export const CLIPS = [
+    { name: 'slide', axis: 0 },
+    { name: 'lift', axis: 1 }
+] as const;
+export const CLIP_DISTANCE = 1;
+export const CLIP_SECONDS = 1;
+
+/** The bytes of `box-clips.glb`: `box.glb` with the `CLIPS` on its one node */
+export function clipsGlb(): ArrayBuffer {
+    const { json, bin } = decodeGlb(boxGlb());
+    const base = bin?.length ?? 0;
+    const times = new Float32Array([0, CLIP_SECONDS]);
+    const tracks = CLIPS.map(({ axis }) => {
+        const end = [0, 0, 0];
+        end[axis] = CLIP_DISTANCE;
+        return new Float32Array([0, 0, 0, ...end]);
+    });
+    const parts = [times, ...tracks].map((part) => new Uint8Array(part.buffer));
+    const extra = parts.reduce((sum, part) => sum + part.length, 0);
+    const out = new Uint8Array(base + extra);
+    if (bin !== undefined) out.set(bin);
+    const views = json.bufferViews as unknown[];
+    const accessors = json.accessors as unknown[];
+    let at = base;
+    const accessorOf = (part: Uint8Array, accessor: Record<string, unknown>): number => {
+        out.set(part, at);
+        views.push({ buffer: 0, byteOffset: at, byteLength: part.length });
+        at += part.length;
+        accessors.push({ bufferView: views.length - 1, componentType: 5126, ...accessor });
+        return accessors.length - 1;
+    };
+    const input = accessorOf(parts[0]!, { count: 2, type: 'SCALAR', min: [0], max: [CLIP_SECONDS] });
+    json.animations = CLIPS.map(({ name }, index) => {
+        const output = accessorOf(parts[index + 1]!, { count: 2, type: 'VEC3' });
+        return { name, samplers: [{ input, output, interpolation: 'LINEAR' }], channels: [{ sampler: 0, target: { node: 0, path: 'translation' } }] };
+    });
+    (json.buffers as { byteLength: number }[])[0]!.byteLength = out.length;
+    return encodeGlb(json, out);
+}
+
 if (import.meta.main) {
-    const out = join(import.meta.dirname, 'box.glb');
-    const glb = boxGlb();
-    writeFileSync(out, new Uint8Array(glb));
-    console.log(`${out}: ${glb.byteLength} bytes`);
+    for (const [name, glb] of [
+        ['box.glb', boxGlb()],
+        ['box-clips.glb', clipsGlb()]
+    ] as const) {
+        const out = join(import.meta.dirname, name);
+        writeFileSync(out, new Uint8Array(glb));
+        console.log(`${out}: ${glb.byteLength} bytes`);
+    }
 }

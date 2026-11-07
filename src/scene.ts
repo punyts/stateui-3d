@@ -8,6 +8,9 @@ import { applyMaterial, materialParams } from './materials.js';
 import { ModelError, disposeModel, parseModel } from './models.js';
 import { RepeatInstances } from './instances.js';
 import { MapTextures } from './textures.js';
+import { Labels } from './labels.js';
+import type { LabelHooks } from './labels.js';
+import { sameValue } from './diff.js';
 import type { ColorResolver, JsonValue, Node3dKind, Scene3dSettings, Scene3dTree } from './tree.js';
 import { DEFAULT_FOV } from './cameras.js';
 
@@ -22,6 +25,9 @@ export const SHADOW_MAP_SIZE = 1024;
 /** The near and far planes of a `camera` node */
 export const CAMERA_NEAR = 0.05;
 export const CAMERA_FAR = 2000;
+
+/** The properties a `label3d` draws from (G3.6b, `labels.ts`) */
+const LABEL_PROPERTIES: readonly string[] = ['_text', 'color', 'fontSize'];
 
 /** The properties whose change makes a node's object again: a light or camera of another `kind` is another class */
 const REBUILT_BY: Partial<Record<Scene3dTree['kind'], readonly string[]>> = { light: ['kind'], camera: ['kind'] };
@@ -58,6 +64,11 @@ export interface ModelHooks {
     readonly onIssue?: (issue: Scene3dIssue) => void;
     /** A model or a map finished loading, or failed: the scene draws again (and stops waiting for it) */
     readonly onSettled?: () => void;
+    /**
+     * A model was added to its node's group (its parsed object, whose clips are in `userData.animations`), or is about
+     * to be freed (`undefined`): the scene plays its clips (G3.9b, `clips.ts`)
+     */
+    readonly onModel?: (path: string, model: Object3D | undefined) => void;
 }
 
 /** A model read or drawn: the id of its file, the abort of its read and, once parsed, its object */
@@ -119,14 +130,19 @@ export class SceneGraph {
     private readonly repeats = new Map<string, RepeatInstances>();
     /** The textures of the meshes' and repeats' `material.map`s (G3.7c), by the node's path */
     private readonly maps: MapTextures;
+    /** The text sprites of the `label3d` nodes (G3.6b), by the node's path */
+    readonly labels: Labels;
 
     constructor(
         private readonly resolve: ColorResolver,
         private readonly convert: (css: string) => Color | undefined,
-        private readonly hooks: ModelHooks = {}
+        private readonly hooks: ModelHooks = {},
+        labelHooks: LabelHooks = {}
     ) {
         this.scene.add(this.root, this.environment);
         this.maps = new MapTextures(hooks);
+        // G3.6b: a label with no `color` takes the scene's `labelColor`
+        this.labels = new Labels(resolve, { ...labelHooks, defaultColor: () => this.settings.labelColor });
     }
 
     /** The tree last given to `sync` */
@@ -258,7 +274,10 @@ export class SceneGraph {
      * (made again only when the preset changes, so the nodes are kept) and the fog. The settings are kept for `restyle`
      */
     applySettings(settings: Scene3dSettings): void {
+        // G3.6b: the labels with no `color` of their own are drawn again in another `labelColor`
+        const labelColor = !sameValue(this.settings.labelColor, settings.labelColor);
         this.settings = settings;
+        if (labelColor) this.labels.restyle();
         const { name, preset } = environmentPreset(settings.environment);
         if (name !== this.environmentName) {
             this.clearEnvironment();
@@ -300,6 +319,8 @@ export class SceneGraph {
             else if (isLight(entry.object)) this.apply(entry, 'color');
         }
         for (const repeat of this.repeats.values()) repeat.restyle();
+        // G3.6b: a label's font and colour are read again
+        this.labels.restyle();
     }
 
     /** Marks every mesh's material to be compiled again (after the renderer's shadow map was turned on), a model's too */
@@ -319,6 +340,7 @@ export class SceneGraph {
         this.scene.fog = null;
         this.fog = undefined;
         this.maps.clear();
+        this.labels.clear();
     }
 
     /** A colour value resolved and converted, or undefined when it names no colour */
@@ -365,8 +387,10 @@ export class SceneGraph {
                 this.repeats.set(tree.path, new RepeatInstances(group, this.resolve, this.convert, { textures: this.maps, path: tree.path }));
                 return group;
             }
+            case 'label3d':
+                // G3.6b: its text sprite is drawn in this group by `labels` (`labels.ts`), so `scale` scales it
+                return new Group();
             default:
-                // label3d draws with its own story (G3.6b)
                 return undefined;
         }
     }
@@ -383,6 +407,8 @@ export class SceneGraph {
         entry.aim?.removeFromParent();
         // A mesh's map (G3.7c) is freed with its texture's bitmap before the material
         this.maps.release(path);
+        // G3.6b: a label's texture, material and quad
+        this.labels.release(path);
         if (object instanceof Mesh) {
             (object.geometry as BufferGeometry).dispose();
             disposeMaterial(object.material as Material);
@@ -427,6 +453,8 @@ export class SceneGraph {
                         }
                         load.content = model;
                         this.entries.get(path)?.object.add(model);
+                        // G3.9b: its clips
+                        this.hooks.onModel?.(path, model);
                         settle();
                     },
                     (error: unknown) => {
@@ -447,7 +475,10 @@ export class SceneGraph {
         if (load === undefined) return;
         this.models.delete(path);
         load.abort.abort();
-        if (load.content !== undefined) disposeModel(load.content);
+        if (load.content === undefined) return;
+        // G3.9b: its clips stop before it is freed
+        this.hooks.onModel?.(path, undefined);
+        disposeModel(load.content);
     }
 
     /** Sets one property of a node on its object */
@@ -477,6 +508,11 @@ export class SceneGraph {
         }
         if (tree.kind === 'model') {
             if (name === 'src') this.loadModel(entry);
+            return;
+        }
+        if (tree.kind === 'label3d') {
+            // G3.6b: drawn again only when its text, font or colour changed
+            if (LABEL_PROPERTIES.includes(name)) this.labels.set(tree.path, object, tree.properties);
             return;
         }
         if (object instanceof Mesh) {

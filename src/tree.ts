@@ -46,6 +46,11 @@ export interface Scene3dSettings {
     readonly fog?: JsonValue;
     /** How a person moves the camera (G3.8b, `controls.ts`): `none` (the default), `orbit` or `pan` */
     readonly controls?: JsonValue;
+    /**
+     * The colour of a `label3d` that sets no `color` (G3.6b, `labels.ts`), a literal or a token reference; the
+     * `scene3d` component passes the `color.text.base` token. Unset or unresolved is black
+     */
+    readonly labelColor?: JsonValue;
 }
 
 /**

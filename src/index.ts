@@ -32,11 +32,17 @@ export { MAP_BITMAP_OPTIONS, MapTextures, TEXTURE_FILE_TYPES, mapSource } from '
 export type { MapSource } from './textures.js';
 export { INSTANCE_CAP, InstanceLayout, MAX_UPDATE_RANGES, MIN_INSTANCE_CAPACITY, RepeatInstances, SHARED_ROW_PROPERTIES, instanceCapacity, instanceMatrix, instanceValues } from './instances.js';
 export type { InstanceChanges, InstanceValues } from './instances.js';
+export { DEFAULT_LABEL_COLOR, DEFAULT_LABEL_FONT, DEFAULT_LABEL_FONT_SIZE, LABEL_FONT_PX, LABEL_LINE_HEIGHT, LABEL_MAX_CHARS, LABEL_MAX_WIDTH, LABEL_PADDING, Labels, MAX_LABEL_FONT_SIZE, labelCanvasSize, labelFont, labelFontSize, labelText } from './labels.js';
+export type { LabelHooks } from './labels.js';
 export { NODE3D_KINDS, isNode3dKind } from './tree.js';
 export type { Bounds3d, ColorResolver, JsonValue, Node3dKind, Scene3dSettings, Scene3dTree, Vector3Tuple } from './tree.js';
 export { DEFAULT_DURATIONS, DEFAULT_EASINGS, REDUCED_MOTION_PROPERTY, createScheduler, cubicBezier, durationToken, easingToken, interpolate, isReducedMotion, parseCubicBezier, parseDuration, parseEasing } from './scheduler.js';
 export type { Easing, FrameTask, ReadToken, Scheduler, SchedulerHost, Timing, TweenValue } from './scheduler.js';
 export { TWEENED_CHANNELS, createMotion3d, formatRgb, timingOf } from './motion.js';
+export { ANIMATION3D_NAMES, BOB_HEIGHT, DEFAULT_ANIMATION_DURATION, PULSE_GROWTH, animatedProperties3d, createAnimations3d, readAnimation3d } from './animate.js';
+export type { Animation3d, Animation3dName, Animations3d } from './animate.js';
+export { ModelClips, unknownClipReason } from './clips.js';
+export type { ModelClipsHooks } from './clips.js';
 export type { Motion3d, Motion3dOptions, Rgb } from './motion.js';
 export { VERSION } from './version.js';
 
