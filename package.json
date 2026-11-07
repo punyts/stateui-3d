@@ -1,0 +1,48 @@
+{
+    "name": "@punyts/stateui-3d",
+    "version": "0.1.0",
+    "publishConfig": {
+        "access": "public"
+    },
+    "type": "module",
+    "description": "Draws StateUI 3D scenes with three.js, as a typed API and as a content-hashed classic script the runtime loads on demand",
+    "main": "dist/index.js",
+    "module": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "default": "./dist/index.js"
+        },
+        "./runtime-chunk/*": "./dist/runtime-chunk/*"
+    },
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "clean": "node -e \"const fs=require('fs');for(const f of ['dist','.build-stamp','.test-build',...fs.readdirSync('.').filter((n)=>n.endsWith('.tsbuildinfo'))])fs.rmSync(f,{recursive:true,force:true})\"",
+        "typecheck": "tsc -p tsconfig.build.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+        "build": "tsc -b tsconfig.build.json && npm run build:runtime-chunk",
+        "build:runtime-chunk": "node runtime-chunk/build.ts",
+        "test": "npm run test:run",
+        "test:run": "vitest run",
+        "test:watch": "vitest --watch",
+        "test:browser": "vitest run --config vitest.browser.config.ts",
+        "build:watch": "tsc -b tsconfig.build.json -w",
+        "dev": "npm run build:watch"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "MIT",
+    "dependencies": {
+        "three": "0.187.0"
+    },
+    "devDependencies": {
+        "@types/three": "0.187.0",
+        "@vitest/browser-playwright": "^4.1.10",
+        "esbuild": "^0.28.1",
+        "playwright": "^1.61.1",
+        "typescript": "^5.9.3",
+        "vitest": "^4.1.10"
+    }
+}

@@ -1,0 +1,24 @@
+{
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "types": [
+            "vitest/globals",
+            "node"
+        ],
+        "module": "ESNext",
+        "moduleResolution": "Bundler",
+        "rootDir": ".",
+        "noEmit": true,
+        "composite": false,
+        "declaration": false,
+        "declarationMap": false,
+        "isolatedModules": true,
+        "allowImportingTsExtensions": true
+    },
+    "include": [
+        "src",
+        "test",
+        "runtime-chunk",
+        "*.config.ts"
+    ]
+}

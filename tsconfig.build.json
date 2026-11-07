@@ -1,0 +1,12 @@
+{
+    "extends": "./tsconfig.json",
+    "include": [
+        "src"
+    ],
+    "exclude": [
+        "src/chunk.ts",
+        "src/chunkGuard.ts",
+        "src/**/*.test.ts",
+        "src/**/*.browser.test.ts"
+    ]
+}

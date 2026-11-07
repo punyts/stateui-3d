@@ -6,5 +6,6 @@ coverage/
 test-results/
 __screenshots__/
 .vitest-attachments/
-# The G3.1 feasibility spike (graphics epic 3), kept on disk until G3.2 ends
+# The G3.1 feasibility spike (graphics epic 3), local only; the package tests replace it
 spike/
+.test-build/
