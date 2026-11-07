@@ -1,9 +1,11 @@
 import type { createScene3d } from './scene3d.js';
 
-export { createScene3d } from './scene3d.js';
-export type { Scene3d, Scene3dOptions } from './scene3d.js';
+export { CONTEXT_RESTORE_TIMEOUT, createScene3d } from './scene3d.js';
+export type { Scene3d, Scene3dInfo, Scene3dOptions, Scene3dStatus } from './scene3d.js';
 export { DEFAULT_CAMERA_POSITION, DEFAULT_FOV, DEFAULT_VIEW_DIRECTION, FRAME_MARGIN, activeCamera, frameBounds, orthographicHeight } from './cameras.js';
 export type { CameraFrame } from './cameras.js';
+export { DEFAULT_ENVIRONMENT, DEFAULT_FOG_FAR, DEFAULT_FOG_NEAR, ENVIRONMENT_NAMES, ENVIRONMENT_PRESETS, environmentPreset, fogParams, isEnvironmentName } from './environment.js';
+export type { EnvironmentLight, EnvironmentName, EnvironmentPreset, FogParams } from './environment.js';
 export { changedProperties, diffTrees, flattenTree, sameValue } from './diff.js';
 export type { FlatNode, TreeDiff } from './diff.js';
 export { GEOMETRY_KINDS, MAX_SEGMENTS, MAX_SIZE, MIN_SEGMENTS, geometryParams, isGeometryKind } from './geometries.js';
@@ -12,7 +14,7 @@ export { DEFAULT_MESH_COLOR, DEFAULT_METALNESS, DEFAULT_ROUGHNESS, materialParam
 export type { MaterialParams } from './materials.js';
 export { FALLBACK_SIZE, MAX_PIXEL_RATIO, Scene3dError, isScene3dError } from './renderer.js';
 export type { Scene3dErrorCode } from './renderer.js';
-export { ENVIRONMENT_AMBIENT, LIGHT_SCALE, lightIntensity } from './scene.js';
+export { LIGHT_SCALE, SHADOW_MAP_SIZE, lightIntensity } from './scene.js';
 export { NODE3D_KINDS, isNode3dKind } from './tree.js';
 export type { Bounds3d, ColorResolver, JsonValue, Node3dKind, Scene3dSettings, Scene3dTree, Vector3Tuple } from './tree.js';
 export { VERSION } from './version.js';

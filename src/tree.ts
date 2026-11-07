@@ -30,14 +30,16 @@ export interface Scene3dTree {
 /**
  * The scene's own properties (the `scene3d` node's), as the feeder reads them. `background` and `ambient` are colours
  * (literals or token references, resolved with the scene's `resolveColor`); the feeder passes the `scene3d.background`
- * and `scene3d.ambient` tokens when the node sets none. `environment` other than `none` adds an ambient light of the
- * `ambient` colour (the presets themselves come with G3.5b). An unset `background` leaves the canvas transparent, so the
- * host's own background shows
+ * and `scene3d.ambient` tokens when the node sets none. `environment` names a lighting preset (`environment.ts`: `none`,
+ * `studio`, the default, `daylight`, `neutral`), and `ambient` is the colour of the `studio` preset's ambient light. An
+ * unset `background` takes the preset's (none for `none`, which leaves the canvas transparent, so the host's own
+ * background shows). `fog` is `{ color, near, far }` (`fogParams`); without a colour it takes the background's
  */
 export interface Scene3dSettings {
     readonly background?: JsonValue;
     readonly ambient?: JsonValue;
     readonly environment?: JsonValue;
+    readonly fog?: JsonValue;
 }
 
 /**

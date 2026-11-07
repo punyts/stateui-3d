@@ -199,8 +199,9 @@ describe('the 3D renderer core in Chromium (G3.5)', () => {
         // Act
         await draw(scene, [front(), box('{color.accent.base}')], { background: '{scene3d.background}', ambient: '{scene3d.ambient}', environment: 'studio' });
 
-        // Assert: the environment's ambient light of 0.4 alone lights the box
-        expectColor(pixelAt(host), [0, 170, 0, 255]);
+        // Assert: the studio environment (G3.5b: its ambient light of the scene3d.ambient colour, a key and a rim light)
+        // lights the green box fully, with a little white of the key light's reflection
+        expectColor(pixelAt(host), [21, 255, 21, 255]);
         expectColor(pixelAt(host, 0.02, 0.02), [0, 0, 255, 255]);
     });
 

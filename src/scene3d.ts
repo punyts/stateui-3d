@@ -16,6 +16,35 @@ export interface Scene3dOptions {
      * is and a token resolves to nothing (the default colour of what it colours)
      */
     readonly resolveColor?: ColorResolver;
+    /**
+     * Told when the scene's picture changes without an `update` from the feeder, so a feeder that marks its readiness
+     * (the `scene3d` component's `data-render`) marks it pending and waits for `drawn()` again: `pending` when the scene
+     * asked for a frame by itself (a resize of the host, a restored WebGL context), `lost` when the WebGL context was lost
+     * (the scene draws nothing until it is restored, and `drawn()` waits for the frame after the restore), `failed`
+     * when it was not restored within `CONTEXT_RESTORE_TIMEOUT` (the feeder shows its fallback; a restore after that
+     * still draws, with `pending`)
+     */
+    readonly onStatus?: (status: Scene3dStatus) => void;
+}
+
+/** What `onStatus` of the scene's options is told (see there) */
+export type Scene3dStatus = 'pending' | 'lost' | 'failed';
+
+/** How long, in milliseconds, a scene waits for a lost WebGL context to be restored before it tells `failed` */
+export const CONTEXT_RESTORE_TIMEOUT = 5000;
+
+/** What a scene holds on the GPU and how it draws, for tests and diagnostics */
+export interface Scene3dInfo {
+    /** The geometries and textures the renderer holds (three.js's `renderer.info.memory`) */
+    readonly memory: { readonly geometries: number; readonly textures: number };
+    /** The shader programs the renderer holds */
+    readonly programs: number;
+    /** True once a light with `shadows` has turned the renderer's shadow map on (it stays on) */
+    readonly shadowMap: boolean;
+    /** True while the WebGL context is lost */
+    readonly contextLost: boolean;
+    /** The environment preset drawn (`none`, `studio`, `daylight`, `neutral`) */
+    readonly environment: string | undefined;
 }
 
 /**
@@ -38,16 +67,28 @@ export interface Scene3d {
     boundsOf(path: string): Bounds3d | undefined;
     /** The element that stands for a node (by its path), the proxy button of an interactive node; undefined when there is none */
     elementOf(path: string): Element | undefined;
+    /**
+     * Resolves every colour again (the scene's own, the environment's ambient and fog, and the nodes'), without making
+     * any object again, and draws: a feeder calls it when the theme or mode changes, since the same tokens then resolve
+     * to other colours. The colours are read when the frame is drawn
+     */
+    restyle(): void;
+    /** What the scene holds on the GPU and how it draws (`Scene3dInfo`) */
+    info(): Scene3dInfo;
     /** Turns reduced motion on or off */
     setReducedMotion(reduced: boolean): void;
     /** True while motion is reduced */
     readonly reducedMotion: boolean;
     /**
-     * Resolves once the last `update` is on screen: after the frame it asked for, at once when none is waiting. A feeder
-     * marks itself ready then (the scene host's `data-render`). Resolves at once after `dispose`
+     * Resolves once the last `update` is on screen: after the frame it asked for, at once when none is waiting. While
+     * the WebGL context is lost it waits for the frame after the restore. A feeder marks itself ready then (the scene
+     * host's `data-render`). Resolves at once after `dispose`
      */
     drawn(): Promise<void>;
-    /** Frees the geometries, materials and the renderer, removes the canvas and stops listening */
+    /**
+     * Frees the geometries, materials, textures, the environment's lights and the renderer (forcing the loss of its
+     * WebGL context), removes the canvas and stops listening
+     */
     dispose(): void;
 }
 
@@ -67,11 +108,13 @@ function shown(object: Object3D | null, root: Object3D): boolean {
  * and a three.js scene built from the node trees given to `update` (`scene.ts`: `camera`, `light`, `mesh`, `group3d`;
  * a `model` is an empty group until G3.7b). It draws through the active camera (`activeCamera`: the first `camera` with
  * `active: true`, else the first one), or, with none, a default perspective camera that frames the bounds of what is
- * drawn (`frameBounds`).
+ * drawn (`frameBounds`). Switching the active camera, the environment preset or the fog makes no node again.
  *
- * It draws on demand: an update, a resize or a restored WebGL context asks for one animation frame, and nothing is
- * scheduled at rest. Throws a `Scene3dError` (`no_webgl`) when the browser gives no WebGL context; the caller shows its
- * fallback then
+ * It draws on demand: an update, a `restyle`, a resize or a restored WebGL context asks for one animation frame, and
+ * nothing is scheduled at rest. The first light with `shadows` turns the renderer's shadow map on, once. On a lost
+ * WebGL context it stops drawing; on its restore it draws the tree it holds again; when the context is not back within
+ * `CONTEXT_RESTORE_TIMEOUT` it tells `onStatus` `failed`. Throws a `Scene3dError` (`no_webgl`) when the browser gives
+ * no WebGL context; the caller shows its fallback then
  */
 export function createScene3d(host: Element, options: Scene3dOptions = {}): Scene3d {
     const view = host.ownerDocument.defaultView;
@@ -85,6 +128,14 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     let disposed = false;
     let frame: number | undefined;
     let waiting: (() => void)[] = [];
+    /** True while the WebGL context is lost: nothing is drawn and `drawn()` waits */
+    let lost = false;
+    /** The timer of `CONTEXT_RESTORE_TIMEOUT` while the context is lost */
+    let restoreTimer: ReturnType<typeof setTimeout> | undefined;
+    /** True when the colours are to be resolved again before the next frame (`restyle`) */
+    let restyled = false;
+    // The defaults of the scene's own properties (the `studio` environment) until the feeder gives its own
+    graph.applySettings({});
 
     const aspect = (): number => renderer.size.width / renderer.size.height;
 
@@ -136,16 +187,26 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
 
     function paint(): void {
         frame = undefined;
-        if (disposed) return;
+        if (disposed || lost) return;
+        if (restyled) {
+            restyled = false;
+            graph.restyle();
+        }
+        // The shadow map is turned on once, by the first light with shadows; the programs compiled without it are
+        // compiled again
+        if (!webgl.shadowMap.enabled && graph.wantsShadows) {
+            webgl.shadowMap.enabled = true;
+            graph.recompile();
+        }
         webgl.render(graph.scene, currentCamera());
         const done = waiting;
         waiting = [];
         for (const settle of done) settle();
     }
 
-    /** Asks for one frame; more changes before it draw in the same frame */
+    /** Asks for one frame; more changes before it draw in the same frame. None while the context is lost */
     function invalidate(): void {
-        if (disposed || frame !== undefined) return;
+        if (disposed || lost || frame !== undefined) return;
         if (view === null) {
             paint();
             return;
@@ -153,8 +214,44 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         frame = view.requestAnimationFrame(paint);
     }
 
-    function resize(width: number, height: number): void {
-        if (!disposed && renderer.resize(width, height)) invalidate();
+    /** Asks for a frame the feeder did not ask for, and tells it so (`pending`) */
+    function invalidateByItself(): void {
+        if (disposed || lost) return;
+        invalidate();
+        options.onStatus?.('pending');
+    }
+
+    function resize(width: number, height: number, byItself = true): void {
+        if (disposed || !renderer.resize(width, height)) return;
+        if (byItself) invalidateByItself();
+        else invalidate();
+    }
+
+    /** The context is lost: three.js draws nothing until it is back (it keeps the context restorable), and nor do we */
+    function onContextLost(): void {
+        if (disposed || lost) return;
+        lost = true;
+        if (frame !== undefined) view?.cancelAnimationFrame(frame);
+        frame = undefined;
+        options.onStatus?.('lost');
+        const timers = view ?? globalThis;
+        restoreTimer = timers.setTimeout(() => {
+            restoreTimer = undefined;
+            if (!disposed && lost) options.onStatus?.('failed');
+        }, CONTEXT_RESTORE_TIMEOUT);
+    }
+
+    /**
+     * The context is back: three.js has set its state up again (its listener ran first) and uploads the geometries and
+     * programs again as they are drawn, so the tree the scene holds is drawn again (G3.1: the first page of a new
+     * headless Chromium loses its contexts once)
+     */
+    function onContextRestored(): void {
+        if (disposed || !lost) return;
+        lost = false;
+        if (restoreTimer !== undefined) (view ?? globalThis).clearTimeout(restoreTimer);
+        restoreTimer = undefined;
+        invalidateByItself();
     }
 
     const observer =
@@ -167,10 +264,9 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
               })
             : undefined;
     observer?.observe(host);
-    // three.js sets its state up again after a restore; the picture has to be drawn again (G3.1: the first page of a
-    // new headless Chromium loses its contexts once)
-    canvas.addEventListener('webglcontextrestored', invalidate);
-    resize(host.clientWidth, host.clientHeight);
+    canvas.addEventListener('webglcontextlost', onContextLost);
+    canvas.addEventListener('webglcontextrestored', onContextRestored);
+    resize(host.clientWidth, host.clientHeight, false);
 
     return {
         update(tree, settings) {
@@ -204,6 +300,21 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             // The proxy buttons of interactive nodes come with G3.8
             return undefined;
         },
+        restyle() {
+            if (disposed) return;
+            restyled = true;
+            invalidate();
+        },
+        info() {
+            const { memory, programs } = webgl.info;
+            return {
+                memory: { geometries: memory.geometries, textures: memory.textures },
+                programs: programs?.length ?? 0,
+                shadowMap: webgl.shadowMap.enabled,
+                contextLost: lost,
+                environment: graph.environmentPreset
+            };
+        },
         setReducedMotion(reduced) {
             if (!disposed) reducedMotion = reduced;
         },
@@ -211,7 +322,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             return reducedMotion;
         },
         drawn() {
-            if (disposed || frame === undefined) return Promise.resolve();
+            if (disposed || (frame === undefined && !lost)) return Promise.resolve();
             return new Promise((settle) => waiting.push(settle));
         },
         dispose() {
@@ -219,11 +330,15 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             disposed = true;
             if (frame !== undefined) view?.cancelAnimationFrame(frame);
             frame = undefined;
+            if (restoreTimer !== undefined) (view ?? globalThis).clearTimeout(restoreTimer);
+            restoreTimer = undefined;
             const done = waiting;
             waiting = [];
             for (const settle of done) settle();
             observer?.disconnect();
-            canvas.removeEventListener('webglcontextrestored', invalidate);
+            // Before the renderer forces its context loss, which would otherwise be taken for one to wait out
+            canvas.removeEventListener('webglcontextlost', onContextLost);
+            canvas.removeEventListener('webglcontextrestored', onContextRestored);
             graph.clear();
             renderer.dispose();
         }

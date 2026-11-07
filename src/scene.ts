@@ -1,6 +1,8 @@
-import { AmbientLight, Color, DirectionalLight, Group, MathUtils, Mesh, MeshStandardMaterial, OrthographicCamera, PerspectiveCamera, PointLight, Scene, SpotLight } from 'three';
-import type { BufferGeometry, Light, Object3D } from 'three';
-import { diffTrees, flattenTree, sameValue } from './diff.js';
+import { AmbientLight, Color, DirectionalLight, Fog, Group, HemisphereLight, MathUtils, Mesh, MeshStandardMaterial, OrthographicCamera, PerspectiveCamera, PointLight, Scene, SpotLight } from 'three';
+import type { BufferGeometry, Light, LightShadow, Material, Object3D, Texture } from 'three';
+import { diffTrees, flattenTree } from './diff.js';
+import { environmentPreset, fogParams } from './environment.js';
+import type { EnvironmentLight, EnvironmentName } from './environment.js';
 import { createGeometry, geometryParams } from './geometries.js';
 import { applyMaterial, materialParams } from './materials.js';
 import type { ColorResolver, JsonValue, Scene3dSettings, Scene3dTree } from './tree.js';
@@ -12,8 +14,8 @@ import { DEFAULT_FOV } from './cameras.js';
  * three.js's physically based lights would draw it at 1/π
  */
 export const LIGHT_SCALE = Math.PI;
-/** The intensity (before `LIGHT_SCALE`) of the ambient light of the `scene3d.ambient` colour an environment adds */
-export const ENVIRONMENT_AMBIENT = 0.4;
+/** The width and height in texels of the shadow map of a light with `shadows` */
+export const SHADOW_MAP_SIZE = 1024;
 /** The near and far planes of a `camera` node */
 export const CAMERA_NEAR = 0.05;
 export const CAMERA_FAR = 2000;
@@ -50,13 +52,18 @@ export class SceneGraph {
     readonly root = new Group();
     private readonly entries = new Map<string, Entry>();
     private trees: readonly Scene3dTree[] = [];
-    private ambient: AmbientLight | undefined;
+    /** The lights of the environment preset, beside `root`; made again only when the preset changes */
+    readonly environment = new Group();
+    private environmentName: EnvironmentName | undefined;
+    private settings: Scene3dSettings = {};
+    /** One fog object while the scene has fog: a new one would make three.js compile every program again */
+    private fog: Fog | undefined;
 
     constructor(
         private readonly resolve: ColorResolver,
         private readonly convert: (css: string) => Color | undefined
     ) {
-        this.scene.add(this.root);
+        this.scene.add(this.root, this.environment);
     }
 
     /** The tree last given to `sync` */
@@ -72,6 +79,19 @@ export class SceneGraph {
     /** The number of nodes that have an object (a test counts them) */
     get size(): number {
         return this.entries.size;
+    }
+
+    /** The environment preset drawn now (undefined before the first settings) */
+    get environmentPreset(): EnvironmentName | undefined {
+        return this.environmentName;
+    }
+
+    /** True while a `light` node casts shadows: the renderer turns its shadow map on then (once) */
+    get wantsShadows(): boolean {
+        for (const { object } of this.entries.values()) {
+            if (isLight(object) && object.castShadow) return true;
+        }
+        return false;
     }
 
     /** Brings the objects in line with a new tree: removes the nodes that went, makes the new ones, changes the rest */
@@ -113,30 +133,82 @@ export class SceneGraph {
         this.trees = trees;
     }
 
-    /** Sets the scene's own properties: the background colour and the ambient light an environment adds */
+    /**
+     * Sets the scene's own properties: the background colour (the preset's when unset), the environment preset's lights
+     * (made again only when the preset changes, so the nodes are kept) and the fog. The settings are kept for `restyle`
+     */
     applySettings(settings: Scene3dSettings): void {
-        const background = settings.background === undefined || settings.background === null ? undefined : this.resolve(settings.background);
-        this.scene.background = (background === undefined ? undefined : this.convert(background)) ?? null;
-        const wanted = settings.environment !== 'none';
-        const css = wanted && settings.ambient !== undefined && settings.ambient !== null ? this.resolve(settings.ambient) : undefined;
-        const colour = css === undefined ? undefined : this.convert(css);
-        if (colour === undefined) {
-            this.ambient?.removeFromParent();
-            this.ambient?.dispose();
-            this.ambient = undefined;
+        this.settings = settings;
+        const { name, preset } = environmentPreset(settings.environment);
+        if (name !== this.environmentName) {
+            this.clearEnvironment();
+            for (const light of preset.lights) this.environment.add(makeEnvironmentLight(light));
+            this.environmentName = name;
+        }
+        const ambient = isUnset(settings.ambient) ? undefined : this.color(settings.ambient);
+        preset.lights.forEach((light, index) => {
+            const object = this.environment.children[index] as Light | undefined;
+            object?.color.copy((light.sceneAmbient === true ? ambient : undefined) ?? new Color(light.color));
+        });
+        const background = isUnset(settings.background)
+            ? preset.background === undefined
+                ? undefined
+                : this.convert(preset.background)
+            : this.color(settings.background);
+        this.scene.background = background ?? null;
+        const fog = fogParams(settings.fog);
+        if (fog === undefined) {
+            this.fog = undefined;
+            this.scene.fog = null;
             return;
         }
-        this.ambient ??= new AmbientLight();
-        this.ambient.color.copy(colour);
-        this.ambient.intensity = ENVIRONMENT_AMBIENT * LIGHT_SCALE;
-        if (this.ambient.parent !== this.scene) this.scene.add(this.ambient);
+        this.fog ??= new Fog(0xffffff);
+        this.fog.color.copy((fog.color === undefined ? undefined : this.color(fog.color)) ?? background ?? new Color(0xffffff));
+        this.fog.near = fog.near;
+        this.fog.far = fog.far;
+        this.scene.fog = this.fog;
     }
 
-    /** Frees every node's geometry and material and forgets the nodes */
+    /**
+     * Resolves every colour again, the scene's own and the nodes' (a theme or mode change gives the same tokens other
+     * values), without making any object again
+     */
+    restyle(): void {
+        this.applySettings(this.settings);
+        for (const entry of this.entries.values()) {
+            if (entry.object instanceof Mesh) this.apply(entry, 'material');
+            else if (isLight(entry.object)) this.apply(entry, 'color');
+        }
+    }
+
+    /** Marks every mesh's material to be compiled again (after the renderer's shadow map was turned on) */
+    recompile(): void {
+        for (const { object } of this.entries.values()) {
+            if (object instanceof Mesh) (object.material as Material).needsUpdate = true;
+        }
+    }
+
+    /** Frees every node's geometry, material and texture and the environment's lights, and forgets the nodes */
     clear(): void {
         for (const path of [...this.entries.keys()]) this.remove(path);
         this.trees = [];
-        this.ambient?.dispose();
+        this.clearEnvironment();
+        this.environmentName = undefined;
+        this.scene.fog = null;
+        this.fog = undefined;
+    }
+
+    /** A colour value resolved and converted, or undefined when it names no colour */
+    private color(value: JsonValue): Color | undefined {
+        const css = this.resolve(value);
+        return css === undefined ? undefined : this.convert(css);
+    }
+
+    private clearEnvironment(): void {
+        for (const light of [...this.environment.children] as Light[]) {
+            light.removeFromParent();
+            light.dispose();
+        }
     }
 
     private add(tree: Scene3dTree): void {
@@ -179,9 +251,10 @@ export class SceneGraph {
         entry.aim?.removeFromParent();
         if (object instanceof Mesh) {
             (object.geometry as BufferGeometry).dispose();
-            (object.material as MeshStandardMaterial).dispose();
+            disposeMaterial(object.material as Material);
         }
-        if (object instanceof AmbientLight || object instanceof DirectionalLight || object instanceof PointLight || object instanceof SpotLight) object.dispose();
+        // A light frees its shadow map
+        if (isLight(object)) object.dispose();
     }
 
     /** Sets one property of a node on its object */
@@ -217,7 +290,7 @@ export class SceneGraph {
             } else if (name === 'material') {
                 applyMaterial(object.material as MeshStandardMaterial, materialParams(value, this.resolve), this.convert);
             } else if (name === 'castShadow' || name === 'receiveShadow') {
-                // Shadows are drawn once a light has them (G3.5b); the flags are kept on the mesh already
+                // Drawn once a light has `shadows` (the renderer's shadow map is turned on then)
                 object[name] = value === true;
             }
             return;
@@ -231,6 +304,16 @@ export class SceneGraph {
             } else if (name === 'target' && entry.aim !== undefined) {
                 if (isVector3(value)) entry.aim.position.set(...value);
                 else entry.aim.position.set(0, 0, 0);
+            } else if (name === 'shadows') {
+                // An ambient light casts none; the others get a shadow map of SHADOW_MAP_SIZE texels a side
+                const casts = value === true && !(object instanceof AmbientLight);
+                const { shadow } = object as Light & { shadow?: LightShadow };
+                if (casts && shadow !== undefined) {
+                    shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+                    shadow.bias = -0.0005;
+                    shadow.normalBias = 0.02;
+                }
+                object.castShadow = casts;
             }
             return;
         }
@@ -242,6 +325,26 @@ export class SceneGraph {
 }
 
 const isLight = (object: Object3D): object is Light => (object as Light).isLight === true;
+
+const isUnset = (value: JsonValue | undefined): value is undefined | null | '' => value === undefined || value === null || value === '';
+
+/** Frees a material and the textures it holds */
+function disposeMaterial(material: Material): void {
+    for (const value of Object.values(material) as unknown[]) {
+        if ((value as Texture | null)?.isTexture === true) (value as Texture).dispose();
+    }
+    material.dispose();
+}
+
+/** The three.js light of one light of an environment preset; its colour is set again by `applySettings` */
+function makeEnvironmentLight(light: EnvironmentLight): Light {
+    const intensity = light.intensity * LIGHT_SCALE;
+    if (light.kind === 'ambient') return new AmbientLight(light.color, intensity);
+    if (light.kind === 'hemisphere') return new HemisphereLight(light.color, light.groundColor ?? light.color, intensity);
+    const sun = new DirectionalLight(light.color, intensity);
+    sun.position.set(...(light.position ?? LIGHT_POSITION));
+    return sun;
+}
 
 /** The light of a `light` node's `kind` (default `directional`); point and spot lights do not fade with distance */
 function makeLight(kind: JsonValue | undefined): Light {
