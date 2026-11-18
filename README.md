@@ -112,12 +112,12 @@ Playwright 1.61.1's headless Chromium (149) draws WebGL2 on SwiftShader with **n
 | `npm run clean` | Removes `dist`, `.test-build` and the build info files |
 
 ## Release checklist
-The packages are published from their own repositories, at the versions in their `package.json` files; while the graphics epics run they all stay at 0.1.0 and collect their changes under `## Unreleased` in their CHANGELOGs, which become the release's section when it is cut.
+Nothing is published to npm: each package is its own repository, and pushing its `develop` branch is its release, since ai-minion's CI and Docker builds clone `develop` of each library. Changes collect under `## Unreleased` in each CHANGELOG; a `version` is bumped only when a consumer raises its range.
 1. **Build and test.** From the workspace root, `npm run mcp:build`; in each package `npm test` (and `npm run test:browser`, `npm run typecheck`).
-2. **Check what is published.** In this package, after the build: `npm pack --dry-run`. The list must show `dist` with `dist/runtime-chunk/<hash>.js` and `dist/runtime-chunk/manifest.json`, `package.json`, `README.md` and `LICENSE`, and no `src`, `spike`, `test`, fixture (`.glb`) or `runtime-chunk/build.ts` files (`files` is `["dist"]`). `test/pack.test.ts` checks the same list in `npm test`.
-3. **Publish in dependency order**, each after the one before is on the registry:
+2. **Check the packed file list.** In this package, after the build: `npm pack --dry-run`. The list must show `dist` with `dist/runtime-chunk/<hash>.js` and `dist/runtime-chunk/manifest.json`, `package.json`, `README.md` and `LICENSE`, and no `src`, `spike`, `test`, fixture (`.glb`) or `runtime-chunk/build.ts` files (`files` is `["dist"]`). `test/pack.test.ts` checks the same list in `npm test`.
+3. **Push `develop` in dependency order**, so a consumer never builds against a dependency without its changes:
    1. `@punyts/stateui-3d` (depends on no punyts package);
    2. `@punyts/stateui-components` (its browser tests draw through this package's chunk; it has no runtime dependency on it);
    3. `@punyts/stateui-app` (its runtime bundle is built with the component library);
    4. `@punyts/stateui-mcp` (takes `@punyts/stateui-3d` as an optional dependency and serves its chunk).
-4. **Lockfile.** A changed dependency in any `package.json` needs `package-lock.json` regenerated with **npm 10**, which CI uses, not a newer local npm, so CI's `npm ci` reads the lockfile it expects: `npx npm@10 install --package-lock-only` at the root of the workspace (and of ai-minion, whose `libraries/<name>` link to these repositories).
+4. **Lockfile.** A changed dependency in any `package.json` needs `package-lock.json` regenerated with **npm 10**, which CI and the Docker images use, not a newer local npm, so their `npm ci` reads the lockfile it expects: `npx npm@10 install --package-lock-only` at the root of the punyts workspace, and at the root of the ai-minion repository (`../ai-minion`), whose `libraries/<name>` folders link to these checkouts locally.
