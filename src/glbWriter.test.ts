@@ -33,6 +33,25 @@ interface Gltf {
 }
 
 describe('writeGlb (docs/design/stateui-3d-glb-export.md)', () => {
+    it('should write a custom geometry as its triangles, flat without indices and smooth with them (mesh editor, V1)', async () => {
+        // Arrange: a square of two triangles, flat, and the same square smooth beside it
+        const square = { kind: 'custom', vertices: [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], faces: [[0, 1, 2, 3]] };
+        const graph = graphOf([node('mesh', 'flat', { geometry: square }), node('mesh', 'smooth', { geometry: { ...square, shading: 'smooth' }, position: [2, 0, 0] })]);
+
+        // Act
+        const bytes = writeGlb(graph.root);
+        const gltf = decodeGlb(bytes).json as unknown as Gltf;
+
+        // Assert
+        expect((await parseModel(bytes)).children.length).toBeGreaterThan(0);
+        const [flat, smooth] = (gltf.meshes ?? []).map((mesh) => mesh.primitives[0]);
+        expect(flat?.indices).toBeUndefined();
+        expect(gltf.accessors?.[flat?.attributes.POSITION ?? -1]?.count).toBe(6);
+        expect(gltf.accessors?.[smooth?.attributes.POSITION ?? -1]?.count).toBe(4);
+        expect(gltf.accessors?.[smooth?.indices ?? -1]?.count).toBe(6);
+        expect(gltf.accessors?.[flat?.attributes.POSITION ?? -1]?.max).toEqual([1, 1, 0]);
+    });
+
     it('should write a GLB the frame loads, with a node per shown mesh at its world matrix and a plain material', async () => {
         // Arrange: a red box in a group moved along x, a hidden sphere
         const graph = graphOf([

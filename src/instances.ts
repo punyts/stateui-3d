@@ -3,6 +3,7 @@ import type { BufferGeometry, Group } from 'three';
 import { sameValue } from './diff.js';
 import { createGeometry, geometryParams } from './geometries.js';
 import { DEFAULT_MESH_COLOR, applyMaterial, materialParams } from './materials.js';
+import { mapSource } from './textures.js';
 import type { MapTextures } from './textures.js';
 import type { ColorResolver, JsonValue, Scene3dTree, Vector3Tuple } from './tree.js';
 
@@ -286,18 +287,19 @@ export class RepeatInstances {
     private geometry: BufferGeometry | undefined;
     private material: MeshStandardMaterial | undefined;
     /** The shared values the mesh was made with, copied */
-    private shared: { geometry?: JsonValue; material?: JsonValue } = {};
+    private shared: { geometry?: JsonValue; material?: JsonValue; custom?: boolean } = {};
 
     /**
      * @param maps The scene's map textures and the repeat's path (G3.7c): the shared material takes the first copy's
-     * `material.map`, read once for the repeat and freed with its material. Without it no map is drawn
+     * `material.map`, read once for the repeat and freed with its material, and told a `custom` geometry's issues (a
+     * `bad_face`, or `no_uvs` for a map it cannot draw). Without it no map is drawn
      * @param part The place in each copy of the mesh this draws (`''` for a mesh row; `InstanceLayout`)
      */
     constructor(
         private readonly group: Group,
         private readonly resolve: ColorResolver,
         private readonly convert: (css: string) => Color | undefined,
-        private readonly maps?: { readonly textures: MapTextures; readonly path: string },
+        private readonly maps?: { readonly textures: MapTextures; readonly path: string; readonly onIssue?: (reason: string) => void },
         part = ''
     ) {
         this.layout = new InstanceLayout(part);
@@ -377,9 +379,17 @@ export class RepeatInstances {
     /** Makes the geometry again when the first copy's differs, and sets the material but its colour, and the shadow flags */
     private applyShared(first: Scene3dTree): void {
         const { geometry, material, castShadow, receiveShadow } = first.properties;
+        let refresh = false;
         if (this.geometry === undefined || !sameValue(this.shared.geometry, geometry)) {
             const old = this.geometry;
-            this.geometry = createGeometry(geometryParams(geometry));
+            const params = geometryParams(geometry);
+            this.geometry = createGeometry(params);
+            if (params.kind === 'custom' && params.bad !== undefined) this.maps?.onIssue?.(`bad_face: ${params.bad}`);
+            // A custom geometry has no texture coordinates: the material is set again when it becomes or stops being one
+            if ((params.kind === 'custom') !== (this.shared.custom === true)) {
+                this.shared.custom = params.kind === 'custom';
+                refresh = true;
+            }
             this.shared.geometry = geometry === undefined ? undefined : (JSON.parse(JSON.stringify(geometry)) as JsonValue);
             if (this.mesh !== undefined) {
                 this.mesh.geometry = this.geometry;
@@ -388,10 +398,12 @@ export class RepeatInstances {
             }
             old?.dispose();
         }
-        if (this.material === undefined || !sameValue(this.shared.material, material)) {
+        if (refresh || this.material === undefined || !sameValue(this.shared.material, material)) {
             this.material ??= new MeshStandardMaterial();
             applyMaterial(this.material, { ...materialParams(material, this.resolve), color: DEFAULT_MESH_COLOR }, this.convert);
-            this.maps?.textures.set(this.maps.path, 'repeat3d', material, this.material);
+            const noUvs = this.shared.custom === true && mapSource(material).kind !== 'none';
+            if (noUvs) this.maps?.onIssue?.('no_uvs');
+            this.maps?.textures.set(this.maps.path, 'repeat3d', noUvs ? { ...(material as Record<string, JsonValue>), map: null } : material, this.material);
             this.shared.material = material === undefined ? undefined : (JSON.parse(JSON.stringify(material)) as JsonValue);
         }
         if (this.mesh !== undefined) {
@@ -483,7 +495,7 @@ export class RepeatRows {
         private readonly group: Group,
         private readonly resolve: ColorResolver,
         private readonly convert: (css: string) => Color | undefined,
-        private readonly maps?: { readonly textures: MapTextures; readonly path: string }
+        private readonly maps?: { readonly textures: MapTextures; readonly path: string; readonly onIssue?: (reason: string) => void }
     ) {}
 
     /** The instances of a part (`''` for a mesh row) */

@@ -88,6 +88,42 @@ describe('createScene3d', () => {
         expect(scene.boundsOf('$.app.children.nothing')).toBeUndefined();
     });
 
+    it('should draw a custom geometry where its vertices are, and hit it', async () => {
+        // Arrange: a triangle in front of the camera, off the origin to the right
+        const geometry = { kind: 'custom', vertices: [[0.5, -0.5, 0], [1.5, -0.5, 0], [1, 0.5, 0]], faces: [[0, 1, 2]] };
+        const shape = node('mesh', 'shape', { interactive: true, geometry });
+
+        // Act
+        scene.update([front(), shape]);
+        await scene.drawn();
+
+        // Assert
+        expect(scene.boundsOf(shape.path)).toEqual({ min: [0.5, -0.5, 0], max: [1.5, 0.5, 0] });
+        expect(scene.hit(60, 40)).toBeUndefined();
+        expect(scene.hit(76, 42)?.path).toBe(shape.path);
+    });
+
+    it('should tell the bad face of a custom geometry and a map it cannot draw once, and draw the rest', () => {
+        // Arrange
+        const issues: unknown[] = [];
+        const told = createScene3d(host, { onIssue: (issue) => issues.push(issue) });
+        const geometry = { kind: 'custom', vertices: [[0, 0, 0], [1, 0, 0], [0, 1, 0]], faces: [[0, 1, 2], [0, 1, 7]] };
+        const map = { id: '3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b', name: 'wood.png', size: 10, type: 'image/png' };
+        const shape = node('mesh', 'shape', { geometry, material: { color: '#ff0000', map } });
+
+        // Act
+        told.update([shape]);
+        told.update([{ ...shape, properties: { ...shape.properties, material: { color: '#00ff00', map } } }]);
+
+        // Assert
+        expect(issues).toEqual([
+            { kind: 'geometry', path: shape.path, node: 'mesh', reason: 'bad_face: 1' },
+            { kind: 'geometry', path: shape.path, node: 'mesh', reason: 'no_uvs' }
+        ]);
+        expect(told.boundsOf(shape.path)).toEqual({ min: [0, 0, 0], max: [1, 1, 0] });
+        told.dispose();
+    });
+
     it('should turn a mesh by its rotation in degrees', () => {
         // Arrange
         const box = node('mesh', 'box', { rotation: [0, 0, 45] });

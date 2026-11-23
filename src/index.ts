@@ -19,8 +19,8 @@ export { DEFAULT_ENVIRONMENT, DEFAULT_FOG_FAR, DEFAULT_FOG_NEAR, ENVIRONMENT_NAM
 export type { EnvironmentLight, EnvironmentName, EnvironmentPreset, FogParams } from './environment.js';
 export { changedProperties, diffTrees, flattenTree, sameValue } from './diff.js';
 export type { FlatNode, TreeDiff } from './diff.js';
-export { GEOMETRY_KINDS, MAX_SEGMENTS, MAX_SIZE, MIN_SEGMENTS, geometryParams, isGeometryKind } from './geometries.js';
-export type { GeometryKind, GeometryParams } from './geometries.js';
+export { GEOMETRY_KINDS, MAX_EDIT_FACES, MAX_EDIT_VERTICES, MAX_FACE_SIDES, MAX_SEGMENTS, MAX_SIZE, MIN_SEGMENTS, SHADINGS, geometryParams, isGeometryKind } from './geometries.js';
+export type { CustomParams, GeometryKind, GeometryParams, Shading } from './geometries.js';
 export { DEFAULT_MESH_COLOR, DEFAULT_METALNESS, DEFAULT_ROUGHNESS, materialParams } from './materials.js';
 export type { MaterialParams } from './materials.js';
 export { FALLBACK_SIZE, MAX_PIXEL_RATIO, Scene3dError, isScene3dError } from './renderer.js';

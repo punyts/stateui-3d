@@ -256,8 +256,15 @@ describe('the 3D renderer core in Chromium (G3.5)', () => {
     });
 
     it.each(GEOMETRY_KINDS)('should draw a %s', async (kind) => {
+        // Arrange: a custom geometry is a unit cube of six square faces
+        const cube = {
+            vertices: [[-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5], [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5]],
+            faces: [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [3, 7, 6, 2], [0, 4, 7, 3], [1, 2, 6, 5]]
+        };
+        const geometry = kind === 'custom' ? { kind, ...cube } : { kind };
+
         // Act
-        await draw(scene, [front(), node('light', 'fill', { kind: 'ambient' }), node('mesh', 'shape', { geometry: { kind }, material: { color: '#ffffff' } })], BLACK_BG);
+        await draw(scene, [front(), node('light', 'fill', { kind: 'ambient' }), node('mesh', 'shape', { geometry, material: { color: '#ffffff' } })], BLACK_BG);
 
         // Assert
         expect(countOther(host, [0, 0, 0])).toBeGreaterThan(50);

@@ -7,7 +7,7 @@ import { createGeometry, geometryParams } from './geometries.js';
 import { applyMaterial, materialParams } from './materials.js';
 import { ModelError, disposeModel, parseModel } from './models.js';
 import { RepeatRows } from './instances.js';
-import { MapTextures } from './textures.js';
+import { MapTextures, mapSource } from './textures.js';
 import { Labels } from './labels.js';
 import type { LabelHooks } from './labels.js';
 import { sameValue } from './diff.js';
@@ -39,10 +39,12 @@ const REBUILT_BY: Partial<Record<Scene3dTree['kind'], readonly string[]>> = { li
  * (a `ModelError`: `not_glb`, `draco`, `meshopt`, `ktx2`, `external_uri` or `invalid_glb`, followed by what in the file
  * it is about), the feeder's `SUI-RUN-3D`. A `mesh`'s `material.map` (G3.7c) is a `file` issue too: a value that is not
  * a picture file (`unsupported_type`), a failed read (its code) or bytes that do not decode (`not_an_image`); for a
- * `repeat3d`, whose instances share the first copy's map, at the repeat's path. The other nodes draw
+ * `repeat3d`, whose instances share the first copy's map, at the repeat's path. `geometry` when a `mesh`'s `custom`
+ * geometry has a face that cannot be drawn (`bad_face: <index>` of the first) or a `material.map`, which it has no
+ * texture coordinates for (`no_uvs`), the feeder's `SUI-RUN-3D`; for a `repeat3d` at the repeat's path. The other nodes draw
  */
 export interface Scene3dIssue {
-    readonly kind: 'file' | 'model';
+    readonly kind: 'file' | 'model' | 'geometry';
     /** The state path of the node */
     readonly path: string;
     readonly reason: string;
@@ -378,6 +380,17 @@ export class SceneGraph {
         for (const name of names) this.apply(entry, name);
     }
 
+    /**
+     * The material value whose map is drawn: without its `map` on a custom geometry, which has no texture coordinates,
+     * told once as a `geometry` issue `no_uvs` (until the map or the custom geometry goes)
+     */
+    private drawnMaterial(path: string, object: Object3D, value: JsonValue | undefined): JsonValue | undefined {
+        const map = mapSource(value).kind !== 'none' && object.userData.custom === true;
+        if (map && object.userData.noUvs !== true) this.hooks.onIssue?.({ kind: 'geometry', path, node: 'mesh', reason: 'no_uvs' });
+        object.userData.noUvs = map;
+        return map ? { ...(value as Record<string, JsonValue>), map: null } : value;
+    }
+
     private make(tree: Scene3dTree): Object3D | undefined {
         switch (tree.kind) {
             case 'group3d':
@@ -394,7 +407,8 @@ export class SceneGraph {
             case 'repeat3d': {
                 // The copies are drawn as one instanced mesh per mesh of the row in this group (G3.6, `instances.ts`), synced after the nodes
                 const group = new Group();
-                this.repeats.set(tree.path, new RepeatRows(group, this.resolve, this.convert, { textures: this.maps, path: tree.path }));
+                const onIssue = (reason: string): void => this.hooks.onIssue?.({ kind: 'geometry', path: tree.path, node: 'repeat3d', reason });
+                this.repeats.set(tree.path, new RepeatRows(group, this.resolve, this.convert, { textures: this.maps, path: tree.path, onIssue }));
                 return group;
             }
             case 'label3d':
@@ -528,12 +542,20 @@ export class SceneGraph {
         if (object instanceof Mesh) {
             if (name === 'geometry') {
                 const old = object.geometry as BufferGeometry;
-                object.geometry = createGeometry(geometryParams(value));
+                const params = geometryParams(value);
+                object.geometry = createGeometry(params);
                 old.dispose();
+                const custom = params.kind === 'custom';
+                if (custom && params.bad !== undefined) this.hooks.onIssue?.({ kind: 'geometry', path: tree.path, node: 'mesh', reason: `bad_face: ${params.bad}` });
+                // A custom geometry has no texture coordinates: its material is set again when it becomes or stops being one
+                if (custom !== (object.userData.custom === true)) {
+                    object.userData.custom = custom;
+                    this.apply(entry, 'material');
+                }
             } else if (name === 'material') {
                 applyMaterial(object.material as MeshStandardMaterial, materialParams(value, this.resolve), this.convert);
                 // G3.7c: the map's file is read once; the same file again (a colour change, a restyle) keeps its texture
-                this.maps.set(tree.path, tree.kind, value, object.material as MeshStandardMaterial);
+                this.maps.set(tree.path, tree.kind, this.drawnMaterial(tree.path, object, value), object.material as MeshStandardMaterial);
             } else if (name === 'castShadow' || name === 'receiveShadow') {
                 // Drawn once a light has `shadows` (the renderer's shadow map is turned on then)
                 object[name] = value === true;
