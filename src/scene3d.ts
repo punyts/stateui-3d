@@ -1,9 +1,10 @@
-import { Box3, OrthographicCamera, PerspectiveCamera, Raycaster, SRGBColorSpace, Vector2, Vector3 } from 'three';
+import { Box3, OrthographicCamera, PerspectiveCamera, Plane, Raycaster, SRGBColorSpace, Vector2, Vector3 } from 'three';
 import type { Camera, Object3D } from 'three';
 import { DEFAULT_FOV, activeCamera, frameBounds, orthographicHeight } from './cameras.js';
 import { controlsMode, createCameraControls } from './controls.js';
 import type { CameraMove, CameraView } from './controls.js';
-import { PressGesture, interactiveNodes, screenBox } from './interaction.js';
+import { PRESS_SLOP, PressGesture, interactiveNodes, screenBox } from './interaction.js';
+import { dragAxes3d, keepPosition3d, positionOf3d, stepMove3d } from './drag.js';
 import { createProxies } from './proxies.js';
 import { createColorConverter } from './materials.js';
 import { createAnimations3d } from './animate.js';
@@ -73,6 +74,12 @@ export interface Scene3dOptions {
      */
     readonly onEvent?: (event: Scene3dEvent) => void;
     /**
+     * Told a dragged node's new `position` (in its parent's space) once when a drag ends, and for each arrow key on its
+     * proxy (docs/design/stateui-3d-drag.md): the feeder writes it, then `onEvent` is told `dragEnd`. Never told during a
+     * drag. Without it no node is dragged
+     */
+    readonly onMove?: (move: NodeMove) => void;
+    /**
      * Reads the font family a `label3d` draws its text in (G3.6b), when the labels are drawn and again on `restyle`.
      * Default: the host's computed `font-family`, so the page font applies; unset or empty is `sans-serif`
      */
@@ -85,10 +92,16 @@ export interface Scene3dOptions {
  * node in world space: where the ray hit it, or the centre of its bounds for a press through its proxy
  */
 export interface Scene3dEvent {
-    readonly name: 'press' | 'hover';
+    readonly name: 'press' | 'hover' | 'dragEnd';
     readonly shape: string;
     readonly key: string;
     readonly point: Vector3Tuple;
+}
+
+/** A dragged node's new `position`, in its parent's space, by its state path (`onMove`) */
+export interface NodeMove {
+    readonly path: string;
+    readonly position: Vector3Tuple;
 }
 
 /** What `onStatus` of the scene's options is told (see there) */
@@ -248,6 +261,15 @@ function shown(object: Object3D | null, root: Object3D): boolean {
  * or Space on a focused one, is a `press` at the centre of the node's bounds. The canvas shows the `move` cursor while
  * the scene has controls (a drag moves the view, wherever it starts), else `pointer` over an interactive node.
  *
+ * Drag (`drag.ts`, docs/design/stateui-3d-drag.md): with `onMove`, a primary pointer pressed on an interactive node with
+ * `draggable` holds the gesture (the controls do not see it). Past `PRESS_SLOP` it moves the node on its parent's x-z
+ * plane through its position, keeping the grab offset, along the axes `draggable` names, inside `bounds`, on multiples
+ * of `step` with `snap`, in the renderer only; within the slop it stays a press. On release `onMove` is told the new
+ * `position` once, the node's tween ends there, and `onEvent` is told `dragEnd`; Escape or a pointer cancel puts the
+ * node back and tells nothing. An arrow key on the node's proxy is a finished move of `step` (ten with Shift). The
+ * cursor is `grab` over a draggable node, `grabbing` during a drag, and the canvas has `touch-action: none`. A
+ * `repeat3d` copy is not dragged.
+ *
  * A node with `transition` (G3.9, `motion.ts`) eases to the values a state change gives its `position`, `rotation`,
  * `scale`, a mesh's `material.color` and `material.opacity`, a light's `intensity` and a camera's `target`, on the
  * scene's scheduler (`scheduler.ts`): a frame per animation frame while a tween runs, none at rest, and `drawn()`
@@ -286,12 +308,16 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     const defaultCamera = new PerspectiveCamera(DEFAULT_FOV, 1, 0.1, 1000);
     const raycaster = new Raycaster();
     // Press and hover (G3.8): the proxy buttons of the interactive nodes, a pointer's press, the node the pointer is in
-    const proxies = createProxies(host, { press: (path) => pressProxy(path) });
+    const proxies = createProxies(host, { press: (path) => pressProxy(path), key: (path, key, shift) => stepProxy(path, key, shift) });
     const press = new PressGesture();
     /** The interactive nodes that are drawn, by path: each has a proxy */
     let interactive = new Map<string, Scene3dTree>();
     /** The path of the interactive node the pointer is in, so `hover` is told once per entry */
     let hovered: string | undefined;
+    /** The drag of a node under way: its tree, its pointer and where it went down, the plane it moves on, the grab offset, where it is */
+    let drag: { tree: Scene3dTree; pointer: number; x: number; y: number; plane: Plane; offset: Vector3; moved: boolean; position: Vector3Tuple } | undefined;
+    /** True when the scene set the canvas's `touch-action` for a draggable node */
+    let ownTouch = false;
     let reducedMotion = options.reducedMotion ?? false;
     let disposed = false;
     let frame: number | undefined;
@@ -583,6 +609,93 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         interactive = new Map(nodes.map((node) => [node.path, node]));
         proxies.sync(nodes);
         if (hovered !== undefined && !interactive.has(hovered)) hovered = undefined;
+        // A drag on a touch screen must not scroll the page
+        const draggable = options.onMove !== undefined && nodes.some((node) => dragAxes3d(node).length > 0);
+        if (draggable && canvas.style.touchAction !== 'none') {
+            canvas.style.touchAction = 'none';
+            ownTouch = true;
+        } else if (!draggable && ownTouch) {
+            if (controls.mode === 'none') canvas.style.touchAction = '';
+            ownTouch = false;
+        }
+    }
+
+    // Dragging a node (docs/design/stateui-3d-drag.md) ------------------------------------------------------------
+
+    /** The draggable node under a point and the plane it moves on: its parent's x-z plane through its position */
+    function draggableAt(x: number, y: number): { tree: Scene3dTree; plane: Plane; offset: Vector3 } | undefined {
+        if (options.onMove === undefined) return undefined;
+        const found = pick(x, y);
+        const object = found === undefined ? undefined : graph.objectOf(found.tree.path);
+        if (found === undefined || object === undefined || dragAxes3d(found.tree).length === 0) return undefined;
+        graph.root.updateWorldMatrix(true, true);
+        const at = object.getWorldPosition(new Vector3());
+        const up = new Vector3(0, 1, 0);
+        if (object.parent) up.transformDirection(object.parent.matrixWorld);
+        const plane = new Plane().setFromNormalAndCoplanarPoint(up, at);
+        const grabbed = raycaster.ray.intersectPlane(plane, new Vector3());
+        return { tree: found.tree, plane, offset: grabbed === null ? new Vector3() : at.sub(grabbed) };
+    }
+
+    /** Shows the dragged node where the pointer puts it on its plane, in the renderer only */
+    function dragTo(x: number, y: number): void {
+        const object = drag === undefined ? undefined : graph.objectOf(drag.tree.path);
+        const { width, height } = renderer.size;
+        if (drag === undefined || object === undefined || width <= 0 || height <= 0) return;
+        raycaster.setFromCamera(new Vector2((x / width) * 2 - 1, -(y / height) * 2 + 1), currentCamera());
+        const hit = raycaster.ray.intersectPlane(drag.plane, new Vector3());
+        // A ray along the plane keeps the last position
+        if (hit === null) return;
+        const local = hit.add(drag.offset);
+        if (object.parent) object.parent.worldToLocal(local);
+        drag.position = keepPosition3d(drag.tree, [local.x, local.y, local.z]);
+        object.position.set(...drag.position);
+        invalidateByItself();
+    }
+
+    /** Ends a drag: a finished one tells `onMove` and `dragEnd`; one called off (`put back`) shows the node where the tree has it */
+    function endDrag(putBack: boolean): void {
+        const ended = drag;
+        drag = undefined;
+        view?.removeEventListener('keydown', onDragKey, true);
+        if (ended === undefined || !ended.moved) return;
+        const object = graph.objectOf(ended.tree.path);
+        if (putBack) {
+            object?.position.set(...positionOf3d(ended.tree));
+            invalidateByItself();
+            return;
+        }
+        finishMove(ended.tree, ended.position);
+    }
+
+    /** A finished move: the node rests at the position (no transition back from where it was), `onMove`, then `dragEnd` */
+    function finishMove(tree: Scene3dTree, position: Vector3Tuple): void {
+        motion.settle(tree.path, { position: [...position] });
+        const object = graph.objectOf(tree.path);
+        object?.position.set(...position);
+        options.onMove?.({ path: tree.path, position });
+        graph.root.updateWorldMatrix(true, true);
+        if (object !== undefined) raise('dragEnd', tree, object.getWorldPosition(new Vector3()));
+        invalidateByItself();
+    }
+
+    /** Escape during a drag puts the node back */
+    const onDragKey = (event: KeyboardEvent): void => {
+        if (event.key !== 'Escape' || drag === undefined) return;
+        event.preventDefault();
+        event.stopPropagation();
+        press.cancel();
+        endDrag(true);
+    };
+
+    /** An arrow key on the proxy of a draggable node moves it by its step: a finished move. True when it moved */
+    function stepProxy(path: string, key: string, shift: boolean): boolean {
+        const tree = interactive.get(path);
+        if (disposed || options.onMove === undefined || tree === undefined || graph.objectOf(path) === undefined) return false;
+        const position = stepMove3d(tree, key, shift);
+        if (position === undefined) return false;
+        finishMove(tree, position);
+        return true;
     }
 
     /** A pointer event's point in CSS pixels from the canvas's top-left corner */
@@ -595,6 +708,18 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         if (disposed || event.button !== 0) return;
         const [x, y] = pointAt(event);
         press.down(event.pointerId, x, y);
+        if (drag !== undefined || !event.isPrimary) return;
+        const found = interactive.size > 0 ? draggableAt(x, y) : undefined;
+        if (found === undefined) return;
+        // The gesture is the node's: the camera controls, listening after this, do not see it
+        event.stopImmediatePropagation();
+        drag = { ...found, pointer: event.pointerId, x, y, moved: false, position: positionOf3d(found.tree) };
+        try {
+            canvas.setPointerCapture(event.pointerId);
+        } catch {
+            // A pointer that is gone already: its up or cancel ends the drag
+        }
+        view?.addEventListener('keydown', onDragKey, true);
     };
 
     /** The pointer moved: farther than the slop makes a press a drag; with no button down, `hover` on entering a node */
@@ -602,10 +727,17 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         if (disposed) return;
         const [x, y] = pointAt(event);
         press.move(event.pointerId, x, y);
+        if (drag !== undefined && event.pointerId === drag.pointer) {
+            if (!drag.moved && Math.hypot(x - drag.x, y - drag.y) <= PRESS_SLOP) return;
+            drag.moved = true;
+            if (canvas.style.cursor !== 'grabbing') canvas.style.cursor = 'grabbing';
+            dragTo(x, y);
+            return;
+        }
         // A drag is not a hover, and keeps its cursor
         if (event.buttons !== 0) return;
         const found = interactive.size > 0 ? pick(x, y) : undefined;
-        const cursor = controls.mode !== 'none' ? 'move' : found !== undefined ? 'pointer' : '';
+        const cursor = found !== undefined && options.onMove !== undefined && dragAxes3d(found.tree).length > 0 ? 'grab' : controls.mode !== 'none' ? 'move' : found !== undefined ? 'pointer' : '';
         if (canvas.style.cursor !== cursor) canvas.style.cursor = cursor;
         const path = found?.tree.path;
         if (path === hovered) return;
@@ -617,12 +749,22 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     const onPointerUp = (event: PointerEvent): void => {
         if (disposed) return;
         const [x, y] = pointAt(event);
+        if (drag !== undefined && event.pointerId === drag.pointer && drag.moved) {
+            press.cancel();
+            canvas.style.cursor = 'grab';
+            endDrag(false);
+            return;
+        }
+        if (drag !== undefined && event.pointerId === drag.pointer) endDrag(false);
         if (!press.up(event.pointerId, x, y)) return;
         const found = pick(x, y);
         if (found !== undefined) raise('press', found.tree, found.point);
     };
 
-    const onPointerCancel = (): void => press.cancel();
+    const onPointerCancel = (): void => {
+        press.cancel();
+        endDrag(true);
+    };
 
     const onPointerLeave = (): void => {
         hovered = undefined;
@@ -773,6 +915,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             canvas.removeEventListener('pointerup', onPointerUp);
             canvas.removeEventListener('pointercancel', onPointerCancel);
             canvas.removeEventListener('pointerleave', onPointerLeave);
+            view?.removeEventListener('keydown', onDragKey, true);
+            drag = undefined;
             proxies.dispose();
             interactive = new Map();
             hovered = undefined;

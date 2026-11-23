@@ -2,7 +2,9 @@ import type { createScene3d } from './scene3d.js';
 
 export { CONTEXT_RESTORE_TIMEOUT, createScene3d } from './scene3d.js';
 export type { Scene3d, Scene3dInfo, Scene3dOptions, Scene3dStatus } from './scene3d.js';
-export type { Scene3dEvent } from './scene3d.js';
+export type { NodeMove, Scene3dEvent } from './scene3d.js';
+export { DEFAULT_STEP_3D, dragAxes3d, keepPosition3d, positionOf3d, stepMove3d } from './drag.js';
+export type { DragAxis3d } from './drag.js';
 export { PRESS_SLOP, PressGesture, interactiveNodes, isShownNode, screenBox } from './interaction.js';
 export type { ScreenBox } from './interaction.js';
 export { createProxies } from './proxies.js';

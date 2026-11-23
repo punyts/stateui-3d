@@ -5,6 +5,8 @@ import type { Scene3dTree } from './tree.js';
 export interface ProxyHooks {
     /** A proxy was clicked (`element.click()`, as `ui_interact` does), or Enter or Space went down on a focused one */
     press(path: string): void;
+    /** Another key without Alt, Control or Meta went down on a focused one: true when the scene used it (an arrow moved a draggable node) */
+    key?(path: string, key: string, shift: boolean): boolean;
 }
 
 /** The proxy buttons of a scene's interactive nodes (`createProxies`) */
@@ -38,7 +40,8 @@ interface Proxy {
  * the canvas, in CSS pixels from the canvas's corner, with `opacity: 0` and `pointer-events: none`: a screen reader and
  * the tab order reach it, `ui_interact` measures a real box, and the pointer goes through to the canvas, where the scene
  * casts its ray. A proxy whose node is off the canvas is hidden. A click on a proxy, or Enter or Space on a focused one
- * (once per key press, held keys do not repeat it), is told to `press`. Every value is set through the CSSOM, never a
+ * (once per key press, held keys do not repeat it), is told to `press`; another key is told to `key` (an arrow moves a
+ * draggable node). Every value is set through the CSSOM, never a
  * `style` attribute (the frame's policy refuses one written as text)
  */
 export function createProxies(host: Element, hooks: ProxyHooks): Proxies {
@@ -89,9 +92,15 @@ export function createProxies(host: Element, hooks: ProxyHooks): Proxies {
     };
 
     const onKey = (event: KeyboardEvent): void => {
-        if (event.key !== 'Enter' && event.key !== ' ') return;
         const path = pathOf(event);
         if (path === undefined) return;
+        if (event.key !== 'Enter' && event.key !== ' ') {
+            if (event.altKey || event.ctrlKey || event.metaKey || hooks.key?.(path, event.key, event.shiftKey) !== true) return;
+            // A key the scene used is not the camera controls' too
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }
         // The button's own activation would click it too (and Enter repeats while held), so the key is handled here alone
         event.preventDefault();
         if (!event.repeat) hooks.press(path);
