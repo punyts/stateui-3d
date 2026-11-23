@@ -32,8 +32,8 @@ export type { GlbInspection, GltfJson, ModelRefusal, ModelRefusalCode } from './
 export { BITMAP_IMAGES_PLUGIN, BITMAP_OPTIONS, ModelError, bitmapImages, disposeModel, parseModel } from './models.js';
 export { MAP_BITMAP_OPTIONS, MapTextures, TEXTURE_FILE_TYPES, mapSource } from './textures.js';
 export type { MapSource } from './textures.js';
-export { INSTANCE_CAP, InstanceLayout, MAX_UPDATE_RANGES, MIN_INSTANCE_CAPACITY, RepeatInstances, SHARED_ROW_PROPERTIES, instanceCapacity, instanceMatrix, instanceValues } from './instances.js';
-export type { InstanceChanges, InstanceValues } from './instances.js';
+export { INSTANCE_CAP, InstanceLayout, MAX_ROW_PARTS, MAX_UPDATE_RANGES, MIN_INSTANCE_CAPACITY, RepeatInstances, RepeatRows, SHARED_ROW_PROPERTIES, instanceCapacity, instanceMatrix, instanceValues, partOf, rowParts } from './instances.js';
+export type { InstanceChanges, InstanceValues, Placement3d } from './instances.js';
 export { DEFAULT_LABEL_COLOR, DEFAULT_LABEL_FONT, DEFAULT_LABEL_FONT_SIZE, LABEL_FONT_PX, LABEL_LINE_HEIGHT, LABEL_MAX_CHARS, LABEL_MAX_WIDTH, LABEL_PADDING, Labels, MAX_LABEL_FONT_SIZE, labelCanvasSize, labelFont, labelFontSize, labelText } from './labels.js';
 export type { LabelHooks } from './labels.js';
 export { NODE3D_KINDS, isNode3dKind } from './tree.js';

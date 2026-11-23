@@ -197,12 +197,13 @@ export interface Scene3d {
 const literalColors: ColorResolver = (value: JsonValue) => (typeof value === 'string' && value.trim() !== '' && !value.trim().startsWith('{') ? value : undefined);
 
 /**
- * The copy of a `repeat3d` that the instance a ray hit draws (G3.6): the instanced mesh knows its `InstanceLayout`, and
- * the copy's `key` is the record key of the index. Undefined for anything that is not an instance
+ * The nodes of a `repeat3d` copy that the instance a ray hit draws (G3.6, docs/design/stateui-3d-group-rows.md): the
+ * mesh, then the groups above it in its copy, innermost first; the instanced mesh knows its `InstanceLayout`. Empty for
+ * anything that is not an instance
  */
-function instanceCopy(object: Object3D, instanceId: number | undefined): Scene3dTree | undefined {
+function instanceChain(object: Object3D, instanceId: number | undefined): readonly Scene3dTree[] {
     const layout = object.userData.layout as InstanceLayout | undefined;
-    return instanceId === undefined || layout === undefined ? undefined : layout.treeAt(instanceId);
+    return instanceId === undefined || layout === undefined ? [] : layout.chainAt(instanceId);
 }
 
 /**
@@ -558,8 +559,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
 
     /**
      * The interactive node drawn at a point of the host in CSS pixels, with the point in world space where the ray met
-     * it: the first node hit, or its nearest interactive ancestor; a `repeat3d` instance gives its copy when that is
-     * interactive (G3.6)
+     * it: the first node hit, or its nearest interactive ancestor; a `repeat3d` instance gives the nearest interactive
+     * node of its copy: the mesh, a group above it, the copy (G3.6)
      */
     function pick(x: number, y: number): { readonly tree: Scene3dTree; readonly point: Vector3 } | undefined {
         if (disposed) return undefined;
@@ -568,9 +569,9 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         raycaster.setFromCamera(new Vector2((x / width) * 2 - 1, -(y / height) * 2 + 1), currentCamera());
         for (const intersection of raycaster.intersectObject(graph.root, true)) {
             if (!shown(intersection.object, graph.root)) continue;
-            // An instance of a repeat3d (G3.6): the copy its index draws, whose key is its record key
-            const copy = instanceCopy(intersection.object, intersection.instanceId);
-            if (copy?.properties.interactive === true) return { tree: copy, point: intersection.point };
+            // An instance of a repeat3d (G3.6): the nearest interactive node of the copy its index draws
+            const copy = instanceChain(intersection.object, intersection.instanceId).find((node) => node.properties.interactive === true);
+            if (copy !== undefined) return { tree: copy, point: intersection.point };
             for (let object: Object3D | null = intersection.object; object && object !== graph.root; object = object.parent) {
                 const tree = object.userData.tree as Scene3dTree | undefined;
                 if (tree?.properties.interactive === true) return { tree, point: intersection.point };

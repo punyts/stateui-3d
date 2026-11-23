@@ -6,7 +6,7 @@ import type { EnvironmentLight, EnvironmentName } from './environment.js';
 import { createGeometry, geometryParams } from './geometries.js';
 import { applyMaterial, materialParams } from './materials.js';
 import { ModelError, disposeModel, parseModel } from './models.js';
-import { RepeatInstances } from './instances.js';
+import { RepeatRows } from './instances.js';
 import { MapTextures } from './textures.js';
 import { Labels } from './labels.js';
 import type { LabelHooks } from './labels.js';
@@ -127,7 +127,7 @@ export class SceneGraph {
     /** The model of each `model` node that has a file, by the node's path */
     private readonly models = new Map<string, ModelLoad>();
     /** The instances of each `repeat3d` node (G3.6), by the node's path */
-    private readonly repeats = new Map<string, RepeatInstances>();
+    private readonly repeats = new Map<string, RepeatRows>();
     /** The textures of the meshes' and repeats' `material.map`s (G3.7c), by the node's path */
     private readonly maps: MapTextures;
     /** The text sprites of the `label3d` nodes (G3.6b), by the node's path */
@@ -195,7 +195,7 @@ export class SceneGraph {
     }
 
     /** The instances of the `repeat3d` node with this path (G3.6) */
-    repeatOf(path: string): RepeatInstances | undefined {
+    repeatOf(path: string): RepeatRows | undefined {
         return this.repeats.get(path);
     }
 
@@ -207,8 +207,8 @@ export class SceneGraph {
     }
 
     /**
-     * The world bounds of the instance a repeat copy's path names (`<repeat>.rows.<recordKey>`, the path the binder gives
-     * a copy), or undefined when no repeat draws it
+     * The world bounds of the instances a repeat copy's path names (`<repeat>.rows.<recordKey>`, the path the binder gives
+     * a copy, or a node inside it: `….children.<key>`), or undefined when no repeat draws it
      */
     instanceBounds(path: string): Box3 | undefined {
         for (const [repeatPath, repeat] of this.repeats) {
@@ -382,9 +382,9 @@ export class SceneGraph {
             case 'camera':
                 return tree.properties.kind === 'orthographic' ? new OrthographicCamera(-1, 1, 1, -1, CAMERA_NEAR, CAMERA_FAR) : new PerspectiveCamera(DEFAULT_FOV, 1, CAMERA_NEAR, CAMERA_FAR);
             case 'repeat3d': {
-                // The copies are drawn as one instanced mesh in this group (G3.6, `instances.ts`), synced after the nodes
+                // The copies are drawn as one instanced mesh per mesh of the row in this group (G3.6, `instances.ts`), synced after the nodes
                 const group = new Group();
-                this.repeats.set(tree.path, new RepeatInstances(group, this.resolve, this.convert, { textures: this.maps, path: tree.path }));
+                this.repeats.set(tree.path, new RepeatRows(group, this.resolve, this.convert, { textures: this.maps, path: tree.path }));
                 return group;
             }
             case 'label3d':

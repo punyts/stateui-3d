@@ -32,12 +32,20 @@ export function instanceCapacity(count: number, current = 0): number {
     return Math.min(capacity, INSTANCE_CAP);
 }
 
-/** What one instance of a repeat draws with: its place, turn (degrees), size, whether it shows, and its colour value */
-export interface InstanceValues {
+/** A node's place, turn (degrees) and size */
+export interface Placement3d {
     readonly position: Vector3Tuple;
     readonly rotation: Vector3Tuple;
     readonly scale: Vector3Tuple;
-    /** False for a copy with `visible: false` or `hidden: true`: drawn at scale zero */
+}
+
+/**
+ * What one instance of a repeat draws with: its place, turn (degrees), size, whether it shows, its colour value, and
+ * the placements of the `group3d`s above it in its copy, outermost first (empty for a mesh row; docs/design/stateui-3d-group-rows.md)
+ */
+export interface InstanceValues extends Placement3d {
+    readonly outer: readonly Placement3d[];
+    /** False for a copy, or a group above it, with `visible: false` or `hidden: true`: drawn at scale zero */
     readonly shown: boolean;
     /** The copy's `material.color` as written (a literal or a token), or undefined for the default */
     readonly color: JsonValue | undefined;
@@ -48,39 +56,84 @@ const isVector3 = (value: JsonValue | undefined): value is [number, number, numb
 
 const isObject = (value: JsonValue | undefined): value is { [key: string]: JsonValue } => typeof value === 'object' && value !== null && !Array.isArray(value);
 
-/** The values a copy of a repeat's row draws its instance with; the vectors are copied, so the copy may change later. Pure */
-export function instanceValues(copy: Scene3dTree): InstanceValues {
-    const { position, rotation, scale, visible, hidden, material } = copy.properties;
-    const color = isObject(material) ? material.color : undefined;
+/** A node's placement, the vectors copied. Pure */
+function placementOf(tree: Scene3dTree): Placement3d {
+    const { position, rotation, scale } = tree.properties;
     return {
         position: isVector3(position) ? [position[0], position[1], position[2]] : [0, 0, 0],
         rotation: isVector3(rotation) ? [rotation[0], rotation[1], rotation[2]] : [0, 0, 0],
-        scale: isVector3(scale) ? [scale[0], scale[1], scale[2]] : [1, 1, 1],
-        shown: visible !== false && hidden !== true,
+        scale: isVector3(scale) ? [scale[0], scale[1], scale[2]] : [1, 1, 1]
+    };
+}
+
+const shownTree = (tree: Scene3dTree): boolean => tree.properties.visible !== false && tree.properties.hidden !== true;
+
+/**
+ * The values a mesh of a repeat's copy draws its instance with: its own, under the `group3d`s `outer` gives (outermost
+ * first; none for a mesh row). The vectors are copied, so the copy may change later. Pure
+ */
+export function instanceValues(copy: Scene3dTree, outer: readonly Scene3dTree[] = []): InstanceValues {
+    const { material } = copy.properties;
+    const color = isObject(material) ? material.color : undefined;
+    return {
+        ...placementOf(copy),
+        outer: outer.map(placementOf),
+        shown: shownTree(copy) && outer.every(shownTree),
         color: color === undefined || color === null || color === '' ? undefined : (JSON.parse(JSON.stringify(color)) as JsonValue)
     };
 }
 
 const sameVector = (a: Vector3Tuple, b: Vector3Tuple): boolean => a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
 
+const samePlacement = (a: Placement3d, b: Placement3d): boolean => sameVector(a.position, b.position) && sameVector(a.rotation, b.rotation) && sameVector(a.scale, b.scale);
+
 /** True when two instances need the same matrix */
 const samePlace = (a: InstanceValues, b: InstanceValues): boolean =>
-    a.shown === b.shown && sameVector(a.position, b.position) && sameVector(a.rotation, b.rotation) && sameVector(a.scale, b.scale);
+    a.shown === b.shown && samePlacement(a, b) && a.outer.length === b.outer.length && a.outer.every((placement, index) => samePlacement(placement, b.outer[index] as Placement3d));
 
 const euler = new Euler();
 const quaternion = new Quaternion();
 const place = new Vector3();
 const size = new Vector3();
 
-/** The matrix of an instance in its repeat's space: scale, then the turn in degrees (XYZ), then the place; zero scale when not shown */
-export function instanceMatrix(values: InstanceValues, into = new Matrix4()): Matrix4 {
-    const [rx, ry, rz] = values.rotation;
+const outerMatrix = new Matrix4();
+
+/** A placement's matrix: scale, then the turn in degrees (XYZ), then the place */
+function placementMatrix(placement: Placement3d, scaled: boolean, into: Matrix4): Matrix4 {
+    const [rx, ry, rz] = placement.rotation;
     euler.set(MathUtils.degToRad(rx), MathUtils.degToRad(ry), MathUtils.degToRad(rz));
     quaternion.setFromEuler(euler);
-    place.set(...values.position);
-    if (values.shown) size.set(...values.scale);
+    place.set(...placement.position);
+    if (scaled) size.set(...placement.scale);
     else size.set(0, 0, 0);
     return into.compose(place, quaternion, size);
+}
+
+/**
+ * The matrix of an instance in its repeat's space: the matrices of the groups above it, outermost first, then its own
+ * (scale, then the turn in degrees, XYZ, then the place); zero scale when it or a group above it is not shown
+ */
+export function instanceMatrix(values: InstanceValues, into = new Matrix4()): Matrix4 {
+    placementMatrix(values, values.shown, into);
+    for (let index = values.outer.length - 1; index >= 0; index--) into.premultiply(placementMatrix(values.outer[index] as Placement3d, true, outerMatrix));
+    return into;
+}
+
+/**
+ * The node at `part` below a copy (`''` the copy itself, `.children.a.children.b` a mesh inside its groups) and the
+ * groups from the copy down to it, outermost first; undefined when the copy has no node there. Pure
+ */
+export function partOf(copy: Scene3dTree, part: string): { readonly tree: Scene3dTree; readonly outer: readonly Scene3dTree[] } | undefined {
+    const outer: Scene3dTree[] = [];
+    let tree: Scene3dTree | undefined = copy;
+    const steps = part === '' ? [] : part.slice(1).split('.');
+    for (let index = 0; index < steps.length && tree !== undefined; index += 2) {
+        if (steps[index] !== 'children') return undefined;
+        outer.push(tree);
+        const key = steps[index + 1];
+        tree = tree.children.find((child) => child.key === key);
+    }
+    return tree === undefined ? undefined : { tree, outer };
 }
 
 /** What one `sync` of an `InstanceLayout` changed: the count after it and the instance indices whose matrix or colour is new */
@@ -93,8 +146,8 @@ export interface InstanceChanges {
 }
 
 /**
- * Which record each instance of a repeat draws, and what changed between two sets of copies. Instance `i` draws the
- * copy `treeAt(i)`, whose `key` is its record key (the binder's `<repeat>.rows.<recordKey>`). A kept record keeps its
+ * Which record each instance of a repeat's part draws, and what changed between two sets of copies. Instance `i` draws
+ * the node at `part` of a copy (`partOf`: the copy itself for `''`), `treeAt(i)`, under the groups `chainAt(i)` gives; the copy's whose `key` is its record key (the binder's `<repeat>.rows.<recordKey>`). A kept record keeps its
  * index, so a change of one record changes one matrix and one colour; a new record takes the next index; a removed
  * record's index is taken by the last instance (one move), so the instances stay packed from 0. Pure: no three.js
  * object is touched, and copies with the same key after the first are ignored
@@ -104,6 +157,10 @@ export class InstanceLayout {
     private readonly indices = new Map<string, number>();
     private values: InstanceValues[] = [];
     private trees: Scene3dTree[] = [];
+    private chains: Scene3dTree[][] = [];
+
+    /** @param part The place in each copy of the node this layout draws (`''`, the copy, for a mesh row) */
+    constructor(readonly part = '') {}
 
     /** The number of instances */
     get count(): number {
@@ -115,9 +172,14 @@ export class InstanceLayout {
         return this.keys[index];
     }
 
-    /** The copy the instance at an index draws, or undefined past the count */
+    /** The node of a copy the instance at an index draws, or undefined past the count */
     treeAt(index: number): Scene3dTree | undefined {
         return this.trees[index];
+    }
+
+    /** The node the instance at an index draws and the groups above it in its copy, innermost first (a ray cast's nearest interactive node) */
+    chainAt(index: number): readonly Scene3dTree[] {
+        return this.chains[index] ?? [];
     }
 
     /** The index of the instance of a record key, or undefined when it draws none */
@@ -132,10 +194,12 @@ export class InstanceLayout {
 
     /** Takes the next set of copies (at most `INSTANCE_CAP`) and tells which instances changed */
     sync(copies: readonly Scene3dTree[]): InstanceChanges {
-        const next = new Map<string, Scene3dTree>();
+        const next = new Map<string, { tree: Scene3dTree; outer: readonly Scene3dTree[] }>();
         for (const copy of copies) {
             if (next.size >= INSTANCE_CAP) break;
-            if (!next.has(copy.key)) next.set(copy.key, copy);
+            if (next.has(copy.key)) continue;
+            const found = partOf(copy, this.part);
+            if (found !== undefined) next.set(copy.key, found);
         }
         const matrices = new Set<number>();
         const colors = new Set<number>();
@@ -150,6 +214,7 @@ export class InstanceLayout {
                 this.keys[index] = moved;
                 this.values[index] = this.values[last] as InstanceValues;
                 this.trees[index] = this.trees[last] as Scene3dTree;
+                this.chains[index] = this.chains[last] as Scene3dTree[];
                 this.indices.set(moved, index);
                 matrices.add(index);
                 colors.add(index);
@@ -157,15 +222,18 @@ export class InstanceLayout {
             this.keys.pop();
             this.values.pop();
             this.trees.pop();
+            this.chains.pop();
         }
-        for (const [key, tree] of next) {
-            const values = instanceValues(tree);
+        for (const [key, { tree, outer }] of next) {
+            const values = instanceValues(tree, outer);
+            const chain = [tree, ...[...outer].reverse()];
             const index = this.indices.get(key);
             if (index === undefined) {
                 const added = this.keys.length;
                 this.keys.push(key);
                 this.values.push(values);
                 this.trees.push(tree);
+                this.chains.push(chain);
                 this.indices.set(key, added);
                 matrices.add(added);
                 colors.add(added);
@@ -176,6 +244,7 @@ export class InstanceLayout {
             if (!sameValue(before.color, values.color)) colors.add(index);
             this.values[index] = values;
             this.trees[index] = tree;
+            this.chains[index] = chain;
         }
         const count = this.keys.length;
         const sorted = (set: Set<number>): number[] => [...set].filter((index) => index < count).sort((a, b) => a - b);
@@ -188,6 +257,7 @@ export class InstanceLayout {
         this.indices.clear();
         this.values = [];
         this.trees = [];
+        this.chains = [];
     }
 }
 
@@ -211,7 +281,7 @@ const box = new Box3();
  * drawn and nothing is held
  */
 export class RepeatInstances {
-    readonly layout = new InstanceLayout();
+    readonly layout: InstanceLayout;
     private mesh: InstancedMesh | undefined;
     private geometry: BufferGeometry | undefined;
     private material: MeshStandardMaterial | undefined;
@@ -221,13 +291,17 @@ export class RepeatInstances {
     /**
      * @param maps The scene's map textures and the repeat's path (G3.7c): the shared material takes the first copy's
      * `material.map`, read once for the repeat and freed with its material. Without it no map is drawn
+     * @param part The place in each copy of the mesh this draws (`''` for a mesh row; `InstanceLayout`)
      */
     constructor(
         private readonly group: Group,
         private readonly resolve: ColorResolver,
         private readonly convert: (css: string) => Color | undefined,
-        private readonly maps?: { readonly textures: MapTextures; readonly path: string }
-    ) {}
+        private readonly maps?: { readonly textures: MapTextures; readonly path: string },
+        part = ''
+    ) {
+        this.layout = new InstanceLayout(part);
+    }
 
     /** The instanced mesh while the repeat draws any instance (a test and the ray cast read it) */
     get instanced(): InstancedMesh | undefined {
@@ -373,6 +447,106 @@ export class RepeatInstances {
         this.material?.dispose();
         this.material = undefined;
         this.shared = {};
+    }
+}
+
+/** The most meshes a `repeat3d`'s row draws (docs/design/stateui-3d-group-rows.md): one instanced mesh each */
+export const MAX_ROW_PARTS = 16;
+
+/**
+ * The places of the meshes of a repeat's copy, in tree order (`''` when the copy is a mesh; `.children.<key>…` below its
+ * `group3d`s), at most `MAX_ROW_PARTS`. Pure
+ */
+export function rowParts(copy: Scene3dTree): string[] {
+    const parts: string[] = [];
+    const walk = (tree: Scene3dTree, at: string): void => {
+        if (parts.length >= MAX_ROW_PARTS) return;
+        if (tree.kind === 'mesh') parts.push(at);
+        else if (tree.kind === 'group3d') for (const child of tree.children) walk(child, `${at}.children.${child.key}`);
+    };
+    walk(copy, '');
+    return parts;
+}
+
+/**
+ * The three.js side of one `repeat3d` (docs/design/stateui-3d-group-rows.md): one `RepeatInstances` per mesh of its row
+ * (`rowParts` of the first copy), all in the repeat's group. A mesh row has one part, the row; a `group3d` row one per
+ * mesh below it, each placed under the groups above it in its copy. A part's map is read at the template's path of the
+ * part (`<repeat>.row.children.<key>…`). A part the copies no longer have is freed
+ */
+export class RepeatRows {
+    private readonly parts = new Map<string, RepeatInstances>();
+
+    constructor(
+        private readonly group: Group,
+        private readonly resolve: ColorResolver,
+        private readonly convert: (css: string) => Color | undefined,
+        private readonly maps?: { readonly textures: MapTextures; readonly path: string }
+    ) {}
+
+    /** The instances of a part (`''` for a mesh row) */
+    partAt(part: string): RepeatInstances | undefined {
+        return this.parts.get(part);
+    }
+
+    /** The instanced mesh of the first part while it draws (a mesh row's one mesh) */
+    get instanced(): InstancedMesh | undefined {
+        return this.parts.values().next().value?.instanced;
+    }
+
+    /** The number of instances drawn, every part's */
+    get count(): number {
+        let count = 0;
+        for (const part of this.parts.values()) count += part.count;
+        return count;
+    }
+
+    /** Draws the copies (the repeat node's `children`, in record order), touching only what changed */
+    sync(copies: readonly Scene3dTree[]): void {
+        const first = copies[0];
+        if (first !== undefined) {
+            const wanted = rowParts(first);
+            for (const [part, instances] of this.parts) {
+                if (wanted.includes(part)) continue;
+                instances.dispose();
+                this.parts.delete(part);
+            }
+            for (const part of wanted) {
+                if (this.parts.has(part)) continue;
+                const maps = this.maps === undefined ? undefined : { textures: this.maps.textures, path: part === '' ? this.maps.path : `${this.maps.path}.row${part}` };
+                this.parts.set(part, new RepeatInstances(this.group, this.resolve, this.convert, maps, part));
+            }
+        }
+        for (const instances of this.parts.values()) instances.sync(copies);
+    }
+
+    /** Resolves every part's colours again (a theme or mode change) */
+    restyle(): void {
+        for (const instances of this.parts.values()) instances.restyle();
+    }
+
+    /**
+     * The world bounds of what a copy's path below `<repeat>.rows.` names: the record key (the whole copy, every part),
+     * or a node inside the copy (`<recordKey>.children.<key>…`, the parts at or below it); undefined when nothing is drawn there
+     */
+    boundsOf(rest: string): Box3 | undefined {
+        const at = rest.indexOf('.children.');
+        const key = at < 0 ? rest : rest.slice(0, at);
+        const below = at < 0 ? '' : rest.slice(at);
+        let found: Box3 | undefined;
+        for (const [part, instances] of this.parts) {
+            if (below !== '' && part !== below && !part.startsWith(`${below}.`)) continue;
+            const bounds = instances.boundsOf(key);
+            if (bounds === undefined) continue;
+            found = found === undefined ? bounds : found.union(bounds);
+        }
+        return found;
+    }
+
+    /** Frees every part */
+    dispose(): void {
+        for (const instances of this.parts.values()) instances.dispose();
+        this.parts.clear();
     }
 }
 

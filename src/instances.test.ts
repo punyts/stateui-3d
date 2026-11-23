@@ -2,7 +2,7 @@ import { Group, InstancedMesh, Matrix4, Raycaster, Vector3 } from 'three';
 import type { MeshStandardMaterial } from 'three';
 import { describe, expect, it } from 'vitest';
 import { flattenTree } from './diff.js';
-import { INSTANCE_CAP, InstanceLayout, MAX_UPDATE_RANGES, MIN_INSTANCE_CAPACITY, RepeatInstances, instanceCapacity, instanceMatrix, instanceValues } from './instances.js';
+import { INSTANCE_CAP, InstanceLayout, MAX_ROW_PARTS, MAX_UPDATE_RANGES, MIN_INSTANCE_CAPACITY, RepeatInstances, RepeatRows, instanceCapacity, instanceMatrix, instanceValues, partOf, rowParts } from './instances.js';
 import { createColorConverter } from './materials.js';
 import { SceneGraph } from './scene.js';
 import type { JsonValue, Scene3dTree } from './tree.js';
@@ -361,5 +361,135 @@ describe('SceneGraph with a repeat3d (G3.6)', () => {
         expect(freed).toBe(true);
         expect(scene.instances).toBe(0);
         expect(scene.repeatOf(REPEAT)).toBeUndefined();
+    });
+});
+
+describe('group3d rows (docs/design/stateui-3d-group-rows.md)', () => {
+    /** A copy of a `group3d` row: a base at its origin and a head inside an inner group lifted one unit */
+    const piece = (key: string, properties: Record<string, JsonValue> = {}, head: Record<string, JsonValue> = {}): Scene3dTree => {
+        const path = `${REPEAT}.rows.${key}`;
+        return {
+            kind: 'group3d',
+            key,
+            path,
+            properties,
+            children: [
+                { kind: 'mesh', key: 'base', path: `${path}.children.base`, properties: { geometry: { kind: 'box' }, material: { color: '#ff0000' } }, children: [] },
+                {
+                    kind: 'group3d',
+                    key: 'top',
+                    path: `${path}.children.top`,
+                    properties: { position: [0, 1, 0] },
+                    children: [{ kind: 'mesh', key: 'head', path: `${path}.children.top.children.head`, properties: { geometry: { kind: 'sphere' }, ...head }, children: [] }]
+                }
+            ]
+        };
+    };
+    const HEAD = '.children.top.children.head';
+    const scene = (): SceneGraph => new SceneGraph(literal, createColorConverter(undefined));
+    const repeatNode = (children: Scene3dTree[]): Scene3dTree => ({ kind: 'repeat3d', key: 'crates', path: REPEAT, properties: {}, children });
+
+    it('should list the meshes of a copy in tree order, the copy itself for a mesh row, and find each with the groups above it', () => {
+        // Act
+        const parts = rowParts(piece('a'));
+        const head = partOf(piece('a'), HEAD);
+
+        // Assert
+        expect(parts).toEqual(['.children.base', HEAD]);
+        expect(rowParts(copy('a'))).toEqual(['']);
+        expect(head?.tree.key).toBe('head');
+        expect(head?.outer.map((tree) => tree.key)).toEqual(['a', 'top']);
+        expect(partOf(piece('a'), '.children.none')).toBeUndefined();
+    });
+
+    it('should cap the meshes of a row at MAX_ROW_PARTS', () => {
+        // Arrange
+        const children = Array.from({ length: MAX_ROW_PARTS + 4 }, (_, index) => ({ ...copy(`m${index}`), key: `m${index}` }));
+
+        // Act
+        const parts = rowParts({ kind: 'group3d', key: 'a', path: `${REPEAT}.rows.a`, properties: {}, children });
+
+        // Assert
+        expect(parts).toHaveLength(MAX_ROW_PARTS);
+    });
+
+    it('should place a part under the groups above it: the copy turned and moved, the inner group lifted', () => {
+        // Arrange
+        const at = partOf(piece('a', { position: [5, 0, 0], rotation: [0, 0, 90] }), HEAD);
+
+        // Act
+        const values = instanceValues(at?.tree as Scene3dTree, at?.outer);
+        const point = new Vector3().applyMatrix4(instanceMatrix(values));
+
+        // Assert: one unit up in the copy, turned 90 degrees about z, is one unit along -x
+        expect(point.x).toBeCloseTo(4, 6);
+        expect(point.y).toBeCloseTo(0, 6);
+        expect(values.outer).toHaveLength(2);
+    });
+
+    it('should hide every part of a copy whose group is hidden', () => {
+        // Arrange
+        const at = partOf(piece('a', { visible: false }), HEAD);
+
+        // Act
+        const values = instanceValues(at?.tree as Scene3dTree, at?.outer);
+
+        // Assert
+        expect(values.shown).toBe(false);
+        expect(instanceMatrix(values).determinant()).toBe(0);
+    });
+
+    it('should draw one instanced mesh per part with an instance per record, and give the chain of a hit innermost first', () => {
+        // Arrange
+        const graph = scene();
+
+        // Act
+        graph.sync([repeatNode([piece('a'), piece('b', { position: [3, 0, 0] })])]);
+        const rows = graph.repeatOf(REPEAT) as RepeatRows;
+        const head = rows.partAt(HEAD)?.instanced as InstancedMesh;
+
+        // Assert
+        expect(graph.instances).toBe(4);
+        expect(rows.partAt('.children.base')?.count).toBe(2);
+        expect(head.count).toBe(2);
+        expect((head.userData.layout as InstanceLayout).chainAt(1).map((tree) => tree.path)).toEqual([`${REPEAT}.rows.b${HEAD}`, `${REPEAT}.rows.b.children.top`, `${REPEAT}.rows.b`]);
+    });
+
+    it('should give the bounds of a copy over all its parts, and of a node inside it over the parts below it', () => {
+        // Arrange
+        const graph = scene();
+        graph.sync([repeatNode([piece('a', { position: [3, 0, 0] })])]);
+
+        // Act
+        const whole = graph.instanceBounds(`${REPEAT}.rows.a`);
+        const top = graph.instanceBounds(`${REPEAT}.rows.a.children.top`);
+        const base = graph.instanceBounds(`${REPEAT}.rows.a.children.base`);
+
+        // Assert: the unit box at y 0 and the unit sphere at y 1
+        expect(whole?.min.y).toBeCloseTo(-0.5, 6);
+        expect(whole?.max.y).toBeCloseTo(1.5, 6);
+        expect(top?.getCenter(new Vector3()).toArray().map((n) => Number(n.toFixed(6)))).toEqual([3, 1, 0]);
+        expect(base?.max.y).toBeCloseTo(0.5, 6);
+        expect(graph.instanceBounds(`${REPEAT}.rows.z`)).toBeUndefined();
+    });
+
+    it('should free a part the copies no longer have, and every part with the node', () => {
+        // Arrange
+        const graph = scene();
+        graph.sync([repeatNode([piece('a')])]);
+        const head = (graph.repeatOf(REPEAT) as RepeatRows).partAt(HEAD)?.instanced as InstancedMesh;
+        let freed = false;
+        head.addEventListener('dispose', () => (freed = true));
+        const headless = piece('a');
+
+        // Act
+        graph.sync([repeatNode([{ ...headless, children: headless.children.slice(0, 1) }])]);
+        const afterParts = graph.instances;
+        graph.sync([]);
+
+        // Assert
+        expect(freed).toBe(true);
+        expect(afterParts).toBe(1);
+        expect(graph.instances).toBe(0);
     });
 });
