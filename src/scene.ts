@@ -211,9 +211,19 @@ export class SceneGraph {
      * a copy, or a node inside it: `….children.<key>`), or undefined when no repeat draws it
      */
     instanceBounds(path: string): Box3 | undefined {
-        for (const [repeatPath, repeat] of this.repeats) {
+        const at = this.copyAt(path);
+        return at?.rows.boundsOf(at.rest);
+    }
+
+    /**
+     * The repeat that draws a copy's path (`<repeat>.rows.<recordKey>`, or a node inside it), its group and the rest of
+     * the path below `.rows.`; undefined when no repeat draws it
+     */
+    copyAt(path: string): { readonly rows: RepeatRows; readonly group: Object3D; readonly rest: string } | undefined {
+        for (const [repeatPath, rows] of this.repeats) {
             const prefix = `${repeatPath}.rows.`;
-            if (path.startsWith(prefix)) return repeat.boundsOf(path.slice(prefix.length));
+            const group = this.objectOf(repeatPath);
+            if (path.startsWith(prefix) && group !== undefined) return { rows, group, rest: path.slice(prefix.length) };
         }
         return undefined;
     }

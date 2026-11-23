@@ -493,3 +493,66 @@ describe('group3d rows (docs/design/stateui-3d-group-rows.md)', () => {
         expect(graph.instances).toBe(0);
     });
 });
+
+describe('dragging copies (docs/design/stateui-3d-drag-copies.md)', () => {
+    const scene = (): SceneGraph => new SceneGraph(literal, createColorConverter(undefined));
+    const repeatNode = (children: Scene3dTree[]): Scene3dTree => ({ kind: 'repeat3d', key: 'crates', path: REPEAT, properties: { position: [0, 0, 10] }, children });
+    const inner = (key: string): Scene3dTree => ({
+        kind: 'group3d',
+        key,
+        path: `${REPEAT}.rows.${key}`,
+        properties: { position: [5, 0, 0] },
+        children: [{ kind: 'mesh', key: 'head', path: `${REPEAT}.rows.${key}.children.head`, properties: { geometry: { kind: 'box' }, position: [0, 1, 0] }, children: [] }]
+    });
+    const centre = (graph: SceneGraph, path: string): number[] => (graph.instanceBounds(path)?.getCenter(new Vector3()).toArray() ?? []).map((n) => Number(n.toFixed(6)));
+
+    it('should find a copy by its path with its repeat, and a node inside it with the matrix of the groups above it', () => {
+        // Arrange
+        const graph = scene();
+        graph.sync([repeatNode([copy('a'), inner('b')])]);
+
+        // Act
+        const whole = graph.copyAt(`${REPEAT}.rows.a`);
+        const head = graph.copyAt(`${REPEAT}.rows.b.children.head`);
+        const node = head?.rows.nodeAt(head.rest);
+
+        // Assert
+        expect(whole?.rest).toBe('a');
+        expect(whole?.group).toBe(graph.objectOf(REPEAT));
+        expect(whole?.rows.nodeAt('a')?.parent.equals(new Matrix4())).toBe(true);
+        expect(node?.tree.key).toBe('head');
+        expect(new Vector3().applyMatrix4(node?.parent as Matrix4).toArray()).toEqual([5, 0, 0]);
+        expect(graph.copyAt(`${REPEAT}.children.x`)).toBeUndefined();
+        expect(whole?.rows.nodeAt('z')).toBeUndefined();
+    });
+
+    it('should draw one copy moved in the renderer only, and draw it as synced again with no position', () => {
+        // Arrange
+        const graph = scene();
+        graph.sync([repeatNode([copy('a'), copy('b', { position: [1, 0, 0] })])]);
+        const rows = graph.repeatOf(REPEAT) as RepeatRows;
+
+        // Act
+        rows.move('a', [4, 0, -2]);
+        const moved = centre(graph, `${REPEAT}.rows.a`);
+        const other = centre(graph, `${REPEAT}.rows.b`);
+        rows.move('a');
+
+        // Assert: the repeat sits at z 10
+        expect(moved).toEqual([4, 0, 8]);
+        expect(other).toEqual([1, 0, 10]);
+        expect(centre(graph, `${REPEAT}.rows.a`)).toEqual([0, 0, 10]);
+    });
+
+    it('should move a node inside a group row within its copy', () => {
+        // Arrange
+        const graph = scene();
+        graph.sync([repeatNode([inner('b')])]);
+
+        // Act
+        (graph.repeatOf(REPEAT) as RepeatRows).move('b.children.head', [0, 1, 3]);
+
+        // Assert
+        expect(centre(graph, `${REPEAT}.rows.b.children.head`)).toEqual([5, 1, 13]);
+    });
+});

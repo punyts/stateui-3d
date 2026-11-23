@@ -476,6 +476,8 @@ export function rowParts(copy: Scene3dTree): string[] {
  */
 export class RepeatRows {
     private readonly parts = new Map<string, RepeatInstances>();
+    /** The copies last synced, as the records have them (a drag draws one moved, and puts it back from these) */
+    private copies: readonly Scene3dTree[] = [];
 
     constructor(
         private readonly group: Group,
@@ -503,6 +505,7 @@ export class RepeatRows {
 
     /** Draws the copies (the repeat node's `children`, in record order), touching only what changed */
     sync(copies: readonly Scene3dTree[]): void {
+        this.copies = copies;
         const first = copies[0];
         if (first !== undefined) {
             const wanted = rowParts(first);
@@ -520,6 +523,35 @@ export class RepeatRows {
         for (const instances of this.parts.values()) instances.sync(copies);
     }
 
+    /**
+     * The node a path below `<repeat>.rows.` names (`<recordKey>`, or `<recordKey>.children.<key>…` inside a group row)
+     * and the matrix of the groups above it in its copy, in the repeat's space (identity for the copy itself); undefined
+     * when no copy has it (docs/design/stateui-3d-drag-copies.md)
+     */
+    nodeAt(rest: string): { readonly tree: Scene3dTree; readonly parent: Matrix4 } | undefined {
+        const [key, below] = splitRest(rest);
+        const copy = this.copies.find((each) => each.key === key);
+        const found = copy === undefined ? undefined : partOf(copy, below);
+        if (found === undefined) return undefined;
+        const parent = new Matrix4();
+        for (const group of found.outer) parent.multiply(placementMatrix(placementOf(group), true, outerMatrix));
+        return { tree: found.tree, parent };
+    }
+
+    /**
+     * Draws the node at `rest` at `position` (its parent's space), only the instances of its copy, in the renderer; with
+     * no position, draws the copies as last synced again (a drag put back, or ended before the records change)
+     */
+    move(rest: string, position?: Vector3Tuple): void {
+        const [key, below] = splitRest(rest);
+        const moved = (node: Scene3dTree, at: string): Scene3dTree =>
+            at === below
+                ? { ...node, properties: { ...node.properties, position: [...(position as Vector3Tuple)] } }
+                : { ...node, children: node.children.map((child) => moved(child, `${at}.children.${child.key}`)) };
+        const copies = position === undefined ? this.copies : this.copies.map((copy) => (copy.key === key ? moved(copy, '') : copy));
+        for (const instances of this.parts.values()) instances.sync(copies);
+    }
+
     /** Resolves every part's colours again (a theme or mode change) */
     restyle(): void {
         for (const instances of this.parts.values()) instances.restyle();
@@ -530,9 +562,7 @@ export class RepeatRows {
      * or a node inside the copy (`<recordKey>.children.<key>…`, the parts at or below it); undefined when nothing is drawn there
      */
     boundsOf(rest: string): Box3 | undefined {
-        const at = rest.indexOf('.children.');
-        const key = at < 0 ? rest : rest.slice(0, at);
-        const below = at < 0 ? '' : rest.slice(at);
+        const [key, below] = splitRest(rest);
         let found: Box3 | undefined;
         for (const [part, instances] of this.parts) {
             if (below !== '' && part !== below && !part.startsWith(`${below}.`)) continue;
@@ -548,6 +578,12 @@ export class RepeatRows {
         for (const instances of this.parts.values()) instances.dispose();
         this.parts.clear();
     }
+}
+
+/** A path below `<repeat>.rows.` as the record key and the place of a node in its copy (`''` the copy) */
+function splitRest(rest: string): [string, string] {
+    const at = rest.indexOf('.children.');
+    return at < 0 ? [rest, ''] : [rest.slice(0, at), rest.slice(at)];
 }
 
 /** An instance buffer's upload the renderer has not made yet: some ranges, or the whole buffer */

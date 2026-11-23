@@ -1,4 +1,4 @@
-import { Box3, OrthographicCamera, PerspectiveCamera, Plane, Raycaster, SRGBColorSpace, Vector2, Vector3 } from 'three';
+import { Box3, Matrix4, OrthographicCamera, PerspectiveCamera, Plane, Raycaster, SRGBColorSpace, Vector2, Vector3 } from 'three';
 import type { Camera, Object3D } from 'three';
 import { DEFAULT_FOV, activeCamera, frameBounds, orthographicHeight } from './cameras.js';
 import { controlsMode, createCameraControls } from './controls.js';
@@ -196,6 +196,12 @@ export interface Scene3d {
 /** A colour resolver that takes a literal as it is and resolves no token */
 const literalColors: ColorResolver = (value: JsonValue) => (typeof value === 'string' && value.trim() !== '' && !value.trim().startsWith('{') ? value : undefined);
 
+/** Where a node a drag moves sits: its parent's world matrix, and how the renderer shows it at a position (none: as the tree has it) */
+interface Held {
+    readonly parent: Matrix4;
+    show(position?: Vector3Tuple): void;
+}
+
 /**
  * The nodes of a `repeat3d` copy that the instance a ray hit draws (G3.6, docs/design/stateui-3d-group-rows.md): the
  * mesh, then the groups above it in its copy, innermost first; the instanced mesh knows its `InstanceLayout`. Empty for
@@ -268,8 +274,9 @@ function shown(object: Object3D | null, root: Object3D): boolean {
  * of `step` with `snap`, in the renderer only; within the slop it stays a press. On release `onMove` is told the new
  * `position` once, the node's tween ends there, and `onEvent` is told `dragEnd`; Escape or a pointer cancel puts the
  * node back and tells nothing. An arrow key on the node's proxy is a finished move of `step` (ten with Shift). The
- * cursor is `grab` over a draggable node, `grabbing` during a drag, and the canvas has `touch-action: none`. A
- * `repeat3d` copy is not dragged.
+ * cursor is `grab` over a draggable node, `grabbing` during a drag, and the canvas has `touch-action: none`. A node of
+ * a `repeat3d` copy drags the same way, its plane the repeat's (or its groups' in the copy), and only that copy's
+ * instances are drawn again (`RepeatRows.move`, docs/design/stateui-3d-drag-copies.md).
  *
  * A node with `transition` (G3.9, `motion.ts`) eases to the values a state change gives its `position`, `rotation`,
  * `scale`, a mesh's `material.color` and `material.opacity`, a light's `intensity` and a camera's `target`, on the
@@ -316,7 +323,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     /** The path of the interactive node the pointer is in, so `hover` is told once per entry */
     let hovered: string | undefined;
     /** The drag of a node under way: its tree, its pointer and where it went down, the plane it moves on, the grab offset, where it is */
-    let drag: { tree: Scene3dTree; pointer: number; x: number; y: number; plane: Plane; offset: Vector3; moved: boolean; position: Vector3Tuple } | undefined;
+    let drag: { tree: Scene3dTree; held: Held; inverse: Matrix4; pointer: number; x: number; y: number; plane: Plane; offset: Vector3; moved: boolean; position: Vector3Tuple } | undefined;
     /** True when the scene set the canvas's `touch-action` for a draggable node */
     let ownTouch = false;
     let reducedMotion = options.reducedMotion ?? false;
@@ -623,34 +630,43 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
 
     // Dragging a node (docs/design/stateui-3d-drag.md) ------------------------------------------------------------
 
+    /**
+     * Where a node a drag can move sits: its parent's world matrix, and how the renderer shows it at a position (none: as
+     * the tree has it). An object of the graph, or a node of a `repeat3d` copy, whose instances are drawn again
+     */
+    function heldOf(tree: Scene3dTree): Held | undefined {
+        graph.root.updateWorldMatrix(true, true);
+        const object = graph.objectOf(tree.path);
+        if (object !== undefined) return { parent: object.parent?.matrixWorld.clone() ?? new Matrix4(), show: (position) => object.position.set(...(position ?? positionOf3d(tree))) };
+        const copy = graph.copyAt(tree.path);
+        const node = copy?.rows.nodeAt(copy.rest);
+        if (copy === undefined || node === undefined) return undefined;
+        return { parent: node.parent.premultiply(copy.group.matrixWorld), show: (position) => copy.rows.move(copy.rest, position) };
+    }
+
     /** The draggable node under a point and the plane it moves on: its parent's x-z plane through its position */
-    function draggableAt(x: number, y: number): { tree: Scene3dTree; plane: Plane; offset: Vector3 } | undefined {
+    function draggableAt(x: number, y: number): { tree: Scene3dTree; held: Held; inverse: Matrix4; plane: Plane; offset: Vector3 } | undefined {
         if (options.onMove === undefined) return undefined;
         const found = pick(x, y);
-        const object = found === undefined ? undefined : graph.objectOf(found.tree.path);
-        if (found === undefined || object === undefined || dragAxes3d(found.tree).length === 0) return undefined;
-        graph.root.updateWorldMatrix(true, true);
-        const at = object.getWorldPosition(new Vector3());
-        const up = new Vector3(0, 1, 0);
-        if (object.parent) up.transformDirection(object.parent.matrixWorld);
-        const plane = new Plane().setFromNormalAndCoplanarPoint(up, at);
+        const held = found === undefined || dragAxes3d(found.tree).length === 0 ? undefined : heldOf(found.tree);
+        if (found === undefined || held === undefined) return undefined;
+        const at = new Vector3(...positionOf3d(found.tree)).applyMatrix4(held.parent);
+        const plane = new Plane().setFromNormalAndCoplanarPoint(new Vector3(0, 1, 0).transformDirection(held.parent), at);
         const grabbed = raycaster.ray.intersectPlane(plane, new Vector3());
-        return { tree: found.tree, plane, offset: grabbed === null ? new Vector3() : at.sub(grabbed) };
+        return { tree: found.tree, held, inverse: held.parent.clone().invert(), plane, offset: grabbed === null ? new Vector3() : at.sub(grabbed) };
     }
 
     /** Shows the dragged node where the pointer puts it on its plane, in the renderer only */
     function dragTo(x: number, y: number): void {
-        const object = drag === undefined ? undefined : graph.objectOf(drag.tree.path);
         const { width, height } = renderer.size;
-        if (drag === undefined || object === undefined || width <= 0 || height <= 0) return;
+        if (drag === undefined || width <= 0 || height <= 0) return;
         raycaster.setFromCamera(new Vector2((x / width) * 2 - 1, -(y / height) * 2 + 1), currentCamera());
         const hit = raycaster.ray.intersectPlane(drag.plane, new Vector3());
         // A ray along the plane keeps the last position
         if (hit === null) return;
-        const local = hit.add(drag.offset);
-        if (object.parent) object.parent.worldToLocal(local);
+        const local = hit.add(drag.offset).applyMatrix4(drag.inverse);
         drag.position = keepPosition3d(drag.tree, [local.x, local.y, local.z]);
-        object.position.set(...drag.position);
+        drag.held.show(drag.position);
         invalidateByItself();
     }
 
@@ -660,9 +676,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         drag = undefined;
         view?.removeEventListener('keydown', onDragKey, true);
         if (ended === undefined || !ended.moved) return;
-        const object = graph.objectOf(ended.tree.path);
         if (putBack) {
-            object?.position.set(...positionOf3d(ended.tree));
+            ended.held.show();
             invalidateByItself();
             return;
         }
@@ -672,11 +687,10 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     /** A finished move: the node rests at the position (no transition back from where it was), `onMove`, then `dragEnd` */
     function finishMove(tree: Scene3dTree, position: Vector3Tuple): void {
         motion.settle(tree.path, { position: [...position] });
-        const object = graph.objectOf(tree.path);
-        object?.position.set(...position);
+        const held = heldOf(tree);
+        held?.show(position);
         options.onMove?.({ path: tree.path, position });
-        graph.root.updateWorldMatrix(true, true);
-        if (object !== undefined) raise('dragEnd', tree, object.getWorldPosition(new Vector3()));
+        if (held !== undefined) raise('dragEnd', tree, new Vector3(...position).applyMatrix4(held.parent));
         invalidateByItself();
     }
 
@@ -692,7 +706,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     /** An arrow key on the proxy of a draggable node moves it by its step: a finished move. True when it moved */
     function stepProxy(path: string, key: string, shift: boolean): boolean {
         const tree = interactive.get(path);
-        if (disposed || options.onMove === undefined || tree === undefined || graph.objectOf(path) === undefined) return false;
+        if (disposed || options.onMove === undefined || tree === undefined || heldOf(tree) === undefined) return false;
         const position = stepMove3d(tree, key, shift);
         if (position === undefined) return false;
         finishMove(tree, position);
