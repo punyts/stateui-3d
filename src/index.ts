@@ -28,6 +28,7 @@ export type { Scene3dErrorCode } from './renderer.js';
 export { LIGHT_SCALE, SHADOW_MAP_SIZE, lightIntensity } from './scene.js';
 export type { ReadSceneFile, Scene3dIssue } from './scene.js';
 export { GLB_MAGIC, decodeDataUri, decodeGlb, encodeGlb, inspectGlb, isDataUri } from './glb.js';
+export { writeGlb } from './glbWriter.js';
 export type { GlbInspection, GltfJson, ModelRefusal, ModelRefusalCode } from './glb.js';
 export { BITMAP_IMAGES_PLUGIN, BITMAP_OPTIONS, ModelError, bitmapImages, disposeModel, parseModel } from './models.js';
 export { MAP_BITMAP_OPTIONS, MapTextures, TEXTURE_FILE_TYPES, mapSource } from './textures.js';

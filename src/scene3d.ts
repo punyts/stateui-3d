@@ -18,6 +18,7 @@ import { SceneGraph, cameraTarget } from './scene.js';
 import type { InstanceLayout } from './instances.js';
 import type { ReadSceneFile, Scene3dIssue } from './scene.js';
 import type { LabelHooks } from './labels.js';
+import { writeGlb } from './glbWriter.js';
 import type { Bounds3d, ColorResolver, JsonValue, Scene3dSettings, Scene3dTree, Vector3Tuple } from './tree.js';
 
 /** What a scene is made with */
@@ -174,6 +175,12 @@ export interface Scene3d {
     restyle(): void;
     /** What the scene holds on the GPU and how it draws (`Scene3dInfo`) */
     info(): Scene3dInfo;
+    /**
+     * A binary glTF 2.0 file of what the scene draws now (docs/design/stateui-3d-glb-export.md): its shown meshes, the
+     * instances of its repeats and the meshes of its models, each with its world matrix and a plain material; no maps,
+     * lights, cameras or labels. Empty of nodes after `dispose`
+     */
+    exportGlb(): ArrayBuffer;
     /** Turns reduced motion on or off */
     setReducedMotion(reduced: boolean): void;
     /** True while motion is reduced */
@@ -870,6 +877,9 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             if (disposed) return;
             restyled = true;
             invalidate();
+        },
+        exportGlb() {
+            return writeGlb(graph.root);
         },
         info() {
             const { memory, programs } = webgl.info;
