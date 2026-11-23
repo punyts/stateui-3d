@@ -4,7 +4,7 @@ import { DEFAULT_FOV } from '../src/cameras.ts';
 import { EDIT_COLORS } from '../src/edit.ts';
 import type { EditElement } from '../src/edit.ts';
 import { createScene3d } from '../src/scene3d.ts';
-import type { MeshPick, NodeMove, Scene3d, Scene3dEvent } from '../src/scene3d.ts';
+import type { MeshGeometry, MeshPick, NodeMove, Scene3d, Scene3dEvent } from '../src/scene3d.ts';
 import type { JsonValue, Scene3dSettings, Scene3dTree } from '../src/tree.ts';
 import { draw, expectColor, front, node, pixelAt, rgbOf } from './pixels.ts';
 
@@ -174,5 +174,88 @@ describe('picking the vertices, edges and faces of a custom mesh in edit mode, i
         // Assert
         expect(scene.info().editing).toBe(0);
         expect(events.map(({ name }) => name)).toEqual(['press']);
+    });
+});
+
+describe('moving the pick of a custom mesh with its gizmo, in Chromium (mesh editor V3)', () => {
+    let host: HTMLElement;
+    let scene: Scene3d;
+    let changes: MeshGeometry[];
+    let moves: NodeMove[];
+
+    /** The front top-right corner picked, with a move gizmo that snaps to half units */
+    const picked = (properties: Record<string, JsonValue> = {}): Scene3dTree => cube('vertex', [2], { gizmo: 'move', snap: true, step: 0.5, ...properties });
+    /** A point on the x arrow of the gizmo at the corner: 30 pixels to its right */
+    const onArrow = (): [number, number] => [vertexAt(2)[0] + 30, vertexAt(2)[1]];
+
+    function hold(dx: number): void {
+        const [x, y] = onArrow();
+        pointer(host, 'pointerdown', x, y);
+        for (const step of [5, 10, 15, dx]) pointer(host, 'pointermove', x + step, y);
+    }
+
+    beforeEach(() => {
+        host = document.createElement('div');
+        host.style.width = `${WIDTH}px`;
+        host.style.height = `${HEIGHT}px`;
+        document.body.append(host);
+        changes = [];
+        moves = [];
+        scene = createScene3d(host, { onPick: () => undefined, onGeometry: (change) => changes.push(change), onMove: (move) => moves.push(move) });
+    });
+
+    afterEach(() => {
+        scene.dispose();
+        host.remove();
+    });
+
+    it('should move the picked vertex along the mesh axis in the renderer while held, and write the geometry once on release', async () => {
+        // Arrange
+        await draw(scene, [front(), sun(), picked()], settings);
+
+        // Act
+        hold(20);
+        const during = scene.boundsOf(picked().path)?.max[0];
+        const written = changes.length;
+        const [x, y] = onArrow();
+        pointer(host, 'pointerup', x + 20, y);
+
+        // Assert: 20 pixels is about 0.6 units at the corner, snapped to 0.5
+        const vertices = [...VERTICES];
+        vertices[2] = [1.5, 1, 1];
+        expect(during).toBeCloseTo(1.5, 5);
+        expect(written).toBe(0);
+        expect(changes).toEqual([{ path: picked().path, geometry: { kind: 'custom', vertices, faces: FACES } }]);
+        expect(moves).toEqual([]);
+    });
+
+    it('should put the vertices back and write nothing on Escape', async () => {
+        // Arrange
+        await draw(scene, [front(), sun(), picked()], settings);
+
+        // Act
+        hold(20);
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+        const [x, y] = onArrow();
+        pointer(host, 'pointerup', x + 20, y);
+
+        // Assert
+        expect(scene.boundsOf(picked().path)?.max[0]).toBeCloseTo(1, 5);
+        expect(changes).toEqual([]);
+    });
+
+    it('should move the mesh, not the pick, with a gizmo and no pick', async () => {
+        // Arrange
+        await draw(scene, [front(), sun(), cube('vertex', [], { gizmo: 'move' })], settings);
+        const [x, y] = [WIDTH / 2 + 30, HEIGHT / 2];
+
+        // Act
+        pointer(host, 'pointerdown', x, y);
+        for (const step of [5, 10, 15, 20]) pointer(host, 'pointermove', x + step, y);
+        pointer(host, 'pointerup', x + 20, y);
+
+        // Assert
+        expect(changes).toEqual([]);
+        expect(moves.map(({ property }) => property)).toEqual(['position']);
     });
 });

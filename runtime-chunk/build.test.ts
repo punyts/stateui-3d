@@ -21,7 +21,12 @@ const GIZMO_GZIP_BYTES = 2_265;
  * (owner, 2026-11-23; docs/design/stateui-mesh-editor.md, V2)
  */
 const MESH_PICK_GZIP_BYTES = 1_932;
-const GZIP_LIMIT = Math.floor(G3_1_GZIP_BYTES * 1.15) + GIZMO_GZIP_BYTES + MESH_PICK_GZIP_BYTES;
+/**
+ * What moving a mesh's pick with the gizmo added, measured when it was built: the gate was raised by it (owner,
+ * 2026-11-23; docs/design/stateui-mesh-editor.md, V3)
+ */
+const MESH_MOVE_GZIP_BYTES = 1_014;
+const GZIP_LIMIT = Math.floor(G3_1_GZIP_BYTES * 1.15) + GIZMO_GZIP_BYTES + MESH_PICK_GZIP_BYTES + MESH_MOVE_GZIP_BYTES;
 
 describe('buildRuntimeChunk', () => {
     let dir: string;

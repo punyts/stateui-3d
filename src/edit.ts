@@ -1,7 +1,7 @@
-import { BufferGeometry, DoubleSide, Float32BufferAttribute, Group, LineBasicMaterial, LineSegments, Mesh, MeshBasicMaterial, Points, PointsMaterial, Scene } from 'three';
+import { BufferGeometry, DoubleSide, Float32BufferAttribute, Group, LineBasicMaterial, LineSegments, Mesh, MeshBasicMaterial, Points, PointsMaterial, Quaternion, Scene, Vector3 } from 'three';
 import type { Material, MeshStandardMaterial, Object3D } from 'three';
 import { geometryParams } from './geometries.js';
-import type { CustomParams } from './geometries.js';
+import type { CustomParams, Vec3 } from './geometries.js';
 import { isShownNode } from './interaction.js';
 import type { JsonValue, Scene3dTree } from './tree.js';
 
@@ -94,6 +94,50 @@ export function segmentDistance(a: ScreenPoint, b: ScreenPoint, x: number, y: nu
     return { distance: Math.hypot(a[0] + along * dx - x, a[1] + along * dy - y), along };
 }
 
+/** One edge of a pick, or every vertex of a picked face: the vertex indices a pick moves, each once, in ascending order */
+export function pickedVertices(mode: EditMode, picked: readonly EditElement[], faces: readonly (readonly number[])[]): number[] {
+    const indices = new Set<number>();
+    for (const element of picked) {
+        if (typeof element !== 'number') element.forEach((index) => indices.add(index));
+        else if (mode === 'face') faces[element]?.forEach((index) => indices.add(index));
+        else indices.add(element);
+    }
+    return [...indices].sort((a, b) => a - b);
+}
+
+/** The centre of the vertices at the indices: their mean, in the mesh's own space */
+export function centreOf(vertices: readonly Vec3[], indices: readonly number[]): Vec3 {
+    const sum = [0, 0, 0];
+    for (const index of indices) (vertices[index] ?? [0, 0, 0]).forEach((value, axis) => (sum[axis] = (sum[axis] as number) + value));
+    const count = Math.max(1, indices.length);
+    return [(sum[0] as number) / count, (sum[1] as number) / count, (sum[2] as number) / count];
+}
+
+/**
+ * What a held handle does to a pick, in the mesh's own space about the pick's centre: `move` by a distance along an
+ * axis, `turn` by degrees about one, `scale` by a factor along one (3: all three)
+ */
+export type PickChange = { readonly kind: 'move'; readonly axis: 0 | 1 | 2; readonly by: number } | { readonly kind: 'turn'; readonly axis: 0 | 1 | 2; readonly degrees: number } | { readonly kind: 'scale'; readonly axis: 0 | 1 | 2 | 3; readonly factor: number };
+
+/** A coordinate without the noise of the maths */
+const clean = (value: number): number => Math.round(value * 1e6) / 1e6 + 0;
+
+/** The vertices with those at the indices changed about the centre; the others are kept as they are */
+export function reshapeVertices(vertices: readonly Vec3[], indices: readonly number[], change: PickChange, centre: Vec3): Vec3[] {
+    const moved = new Set(indices);
+    const about = new Vector3();
+    if (change.kind === 'turn') about.setComponent(change.axis, 1);
+    const turn = change.kind === 'turn' ? new Quaternion().setFromAxisAngle(about, (change.degrees * Math.PI) / 180) : undefined;
+    return vertices.map((vertex, index): Vec3 => {
+        if (!moved.has(index)) return vertex;
+        const point = new Vector3(vertex[0] - centre[0], vertex[1] - centre[1], vertex[2] - centre[2]);
+        if (change.kind === 'move') point.setComponent(change.axis, point.getComponent(change.axis) + change.by);
+        else if (turn !== undefined) point.applyQuaternion(turn);
+        else if (change.kind === 'scale') for (const axis of [0, 1, 2]) if (change.axis === 3 || change.axis === axis) point.setComponent(axis, point.getComponent(axis) * change.factor);
+        return [clean(point.x + centre[0]), clean(point.y + centre[1]), clean(point.z + centre[2])];
+    });
+}
+
 /** One mesh in edit mode: its node, its geometry read, its pick, the overlay drawn for them and the key they were drawn from */
 export interface EditEntry {
     readonly tree: Scene3dTree;
@@ -166,6 +210,16 @@ export class EditOverlay {
 
     entries(): IterableIterator<EditEntry> {
         return this.shown.values();
+    }
+
+    /** Draws a mesh's overlay again over vertices a held handle moved, or over its geometry's own (none) */
+    show(path: string, vertices?: readonly Vec3[]): void {
+        const entry = this.shown.get(path);
+        if (entry === undefined) return;
+        this.drop(entry);
+        const group = this.draw(entry.mode, vertices === undefined ? entry.params : { ...entry.params, vertices }, entry.picked);
+        this.scene.add(group);
+        this.shown.set(path, { ...entry, group });
     }
 
     /** Puts each overlay where its mesh is drawn this frame; a mesh that is not drawn hides it */

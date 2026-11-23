@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { editModeOf, meshEdges, nearPoints, readPicked, segmentDistance, togglePick } from './edit.js';
+import { centreOf, editModeOf, meshEdges, nearPoints, pickedVertices, readPicked, reshapeVertices, segmentDistance, togglePick } from './edit.js';
 import type { CustomParams } from './geometries.js';
 import type { JsonValue, Scene3dTree } from './tree.js';
 
@@ -64,5 +64,41 @@ describe('edit', () => {
         expect(segmentDistance([0, 0], [10, 0], 5, 3)).toEqual({ distance: 3, along: 0.5 });
         expect(segmentDistance([0, 0], [10, 0], -4, 3)).toEqual({ distance: 5, along: 0 });
         expect(segmentDistance([2, 2], [2, 2], 5, 6)).toEqual({ distance: 5, along: 0 });
+    });
+    it('should give the vertices a pick moves once each, in order, for each mode', () => {
+        // Arrange
+        const faces = [[0, 1, 2], [2, 1, 3]];
+
+        // Act and assert
+        expect(pickedVertices('vertex', [3, 1, 3], faces)).toEqual([1, 3]);
+        expect(pickedVertices('edge', [[1, 2], [0, 1]], faces)).toEqual([0, 1, 2]);
+        expect(pickedVertices('face', [1, 0], faces)).toEqual([0, 1, 2, 3]);
+    });
+
+    it('should give the centre of the picked vertices', () => {
+        // Act
+        const centre = centreOf(square.vertices, [0, 1, 2, 3]);
+
+        // Assert
+        expect(centre).toEqual([0.5, 0.5, 0]);
+    });
+
+    it('should move, turn and scale the picked vertices about their centre, and keep the others', () => {
+        // Arrange
+        const vertices = square.vertices;
+        const centre = centreOf(vertices, [1, 2]);
+
+        // Act
+        const moved = reshapeVertices(vertices, [1, 2], { kind: 'move', axis: 2, by: 0.5 }, centre);
+        const turned = reshapeVertices(vertices, [0, 1, 2, 3], { kind: 'turn', axis: 2, degrees: 90 }, [0.5, 0.5, 0]);
+        const scaled = reshapeVertices(vertices, [1, 2], { kind: 'scale', axis: 1, factor: 2 }, centre);
+        const grown = reshapeVertices(vertices, [0, 1, 2, 3], { kind: 'scale', axis: 3, factor: 0.5 }, [0.5, 0.5, 0]);
+
+        // Assert
+        expect(moved).toEqual([[0, 0, 0], [1, 0, 0.5], [1, 1, 0.5], [0, 1, 0]]);
+        expect(turned).toEqual([[1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 0]]);
+        expect(scaled).toEqual([[0, 0, 0], [1, -0.5, 0], [1, 1.5, 0], [0, 1, 0]]);
+        expect(grown).toEqual([[0.25, 0.25, 0], [0.75, 0.25, 0], [0.75, 0.75, 0], [0.25, 0.75, 0]]);
+        expect(moved[0]).toBe(vertices[0]);
     });
 });

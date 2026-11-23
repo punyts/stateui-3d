@@ -1,10 +1,12 @@
 import { Box3, Euler, MathUtils, Matrix4, OrthographicCamera, PerspectiveCamera, Plane, Quaternion, Raycaster, SRGBColorSpace, Vector2, Vector3 } from 'three';
-import type { Camera, Mesh, Object3D } from 'three';
+import type { BufferGeometry, Camera, Mesh, Object3D } from 'three';
 import { DEFAULT_FOV, activeCamera, frameBounds, orthographicHeight } from './cameras.js';
 import { controlsMode, createCameraControls } from './controls.js';
 import type { CameraMove, CameraView } from './controls.js';
 import { PRESS_SLOP, PressGesture, interactiveNodes, screenBox } from './interaction.js';
-import { dragAxes3d, keepPosition3d, positionOf3d, stepMove3d } from './drag.js';
+import { DEFAULT_STEP_3D, dragAxes3d, keepPosition3d, positionOf3d, stepMove3d } from './drag.js';
+import { createGeometry, geometryParams } from './geometries.js';
+import type { Vec3 } from './geometries.js';
 import { createProxies } from './proxies.js';
 import { createColorConverter } from './materials.js';
 import { createAnimations3d } from './animate.js';
@@ -19,10 +21,10 @@ import type { InstanceLayout } from './instances.js';
 import type { ReadSceneFile, Scene3dIssue } from './scene.js';
 import type { LabelHooks } from './labels.js';
 import { writeGlb } from './glbWriter.js';
-import { GIZMO_PIXELS, GIZMO_PROPERTY, Gizmos, gizmoValue, movedPosition, scaledScale, turnedRotation } from './gizmo.js';
+import { GIZMO_PIXELS, GIZMO_PROPERTY, Gizmos, MIN_GIZMO_SCALE, ROTATE_SNAP, SCALE_SNAP, gizmoValue, movedPosition, scaledScale, turnedRotation } from './gizmo.js';
 import type { GizmoHandle, GizmoPlace, GizmoProperty } from './gizmo.js';
-import { EDGE_PICK_PIXELS, EditOverlay, VERTEX_PICK_PIXELS, meshEdges, nearPoints, segmentDistance, togglePick } from './edit.js';
-import type { EditElement, ScreenPoint } from './edit.js';
+import { EDGE_PICK_PIXELS, EditOverlay, VERTEX_PICK_PIXELS, centreOf, meshEdges, nearPoints, pickedVertices, reshapeVertices, segmentDistance, togglePick } from './edit.js';
+import type { EditElement, PickChange, ScreenPoint } from './edit.js';
 import type { Bounds3d, ColorResolver, JsonValue, Scene3dSettings, Scene3dTree, Vector3Tuple } from './tree.js';
 
 /** What a scene is made with */
@@ -91,6 +93,11 @@ export interface Scene3dOptions {
      */
     readonly onPick?: (pick: MeshPick) => void;
     /**
+     * Told a mesh's new `geometry` once when a gizmo's handle that moved its pick is let go (docs/design/stateui-mesh-editor.md,
+     * V3): the feeder writes it. Without it a mesh's gizmo moves the mesh, never its pick
+     */
+    readonly onGeometry?: (change: MeshGeometry) => void;
+    /**
      * Reads the font family a `label3d` draws its text in (G3.6b), when the labels are drawn and again on `restyle`.
      * Default: the host's computed `font-family`, so the page font applies; unset or empty is `sans-serif`
      */
@@ -120,6 +127,24 @@ export interface NodeMove {
 export interface MeshPick {
     readonly path: string;
     readonly picked: readonly EditElement[];
+}
+
+/** A mesh's new `geometry` (`onGeometry`): its geometry with the moved vertices */
+export interface MeshGeometry {
+    readonly path: string;
+    readonly geometry: JsonValue;
+}
+
+/** A held handle of a mesh's pick: the mesh, its geometry, the vertices it moves about their centre, the drawn geometry to put back and the vertices shown now */
+interface PickHold {
+    readonly mesh: Mesh;
+    readonly geometry: { readonly [key: string]: JsonValue };
+    readonly vertices: readonly Vec3[];
+    readonly indices: readonly number[];
+    readonly centre: Vec3;
+    readonly inverse: Matrix4;
+    readonly original: BufferGeometry;
+    shown: readonly Vec3[];
 }
 
 /** What `onStatus` of the scene's options is told (see there) */
@@ -366,7 +391,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     const overlay = new EditOverlay();
     const seer = new Raycaster();
     /** The handle a pointer holds: the node, its axis in world space, where it was grabbed, the value it shows now */
-    let turn: { tree: Scene3dTree; held: Held; handle: GizmoHandle; property: GizmoProperty; pointer: number; x: number; y: number; origin: Vector3; axis: Vector3; inverse: Matrix4; grab: Vector3; value: Vector3Tuple; moved: boolean } | undefined;
+    let turn: { tree: Scene3dTree; held: Held; handle: GizmoHandle; property: GizmoProperty; pointer: number; x: number; y: number; origin: Vector3; axis: Vector3; inverse: Matrix4; grab: Vector3; value: Vector3Tuple; moved: boolean; pick?: PickHold } | undefined;
     let reducedMotion = options.reducedMotion ?? false;
     let disposed = false;
     let frame: number | undefined;
@@ -673,10 +698,11 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         interactive = new Map(nodes.map((node) => [node.path, node]));
         proxies.sync(nodes);
         if (hovered !== undefined && !interactive.has(hovered)) hovered = undefined;
-        if (options.onMove !== undefined) gizmos.sync(nodes);
         if (options.onPick !== undefined) overlay.sync(nodes, (path) => graph.objectOf(path));
+        // A mesh's gizmo acts on its pick with `onGeometry`, any other node's on the node with `onMove`
+        gizmos.sync(nodes.filter((node) => pickOf(node) !== undefined || options.onMove !== undefined));
         // A drag on a touch screen must not scroll the page
-        const draggable = options.onMove !== undefined && (gizmos.size > 0 || nodes.some((node) => dragAxes3d(node).length > 0));
+        const draggable = gizmos.size > 0 || (options.onMove !== undefined && nodes.some((node) => dragAxes3d(node).length > 0));
         if (draggable && canvas.style.touchAction !== 'none') {
             canvas.style.touchAction = 'none';
             ownTouch = true;
@@ -714,6 +740,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
 
     /** Where a node's gizmo sits, with the value its held handle shows; undefined for a node that draws nothing */
     function placeOf(tree: Scene3dTree): GizmoPlace | undefined {
+        if (pickOf(tree) !== undefined) return pickPlace(tree);
         const held = heldOf(tree);
         if (held === undefined) return undefined;
         const shows = (name: GizmoProperty): Vector3Tuple => (turn?.tree.path === tree.path && turn.property === name ? turn.value : gizmoValue(tree, name));
@@ -730,6 +757,64 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         return true;
     }
 
+    // Moving a mesh's pick (docs/design/stateui-mesh-editor.md, V3) -----------------------------------------------
+
+    /**
+     * A mesh in edit mode whose gizmo acts on its pick: one with picked elements in a scene with `onGeometry`. Its
+     * vertices as its geometry has them, the indices the pick moves and the drawn mesh
+     */
+    function pickOf(tree: Scene3dTree): { mesh: Mesh; vertices: readonly Vec3[]; indices: number[] } | undefined {
+        const entry = options.onGeometry === undefined ? undefined : overlay.entry(tree.path);
+        const mesh = entry === undefined || entry.picked.length === 0 ? undefined : graph.objectOf(tree.path);
+        if (entry === undefined || mesh === undefined || !(mesh as Mesh).isMesh) return undefined;
+        const indices = pickedVertices(entry.mode, entry.picked, entry.params.faces);
+        return indices.length === 0 ? undefined : { mesh: mesh as Mesh, vertices: entry.params.vertices, indices };
+    }
+
+    /** Where the gizmo of a pick sits: the centre of the picked vertices as drawn now, turned with the mesh */
+    function pickPlace(tree: Scene3dTree): GizmoPlace | undefined {
+        const pick = pickOf(tree);
+        if (pick === undefined) return undefined;
+        graph.root.updateWorldMatrix(true, true);
+        const shown = turn?.pick !== undefined && turn.tree.path === tree.path ? turn.pick.shown : pick.vertices;
+        const own = new Quaternion();
+        pick.mesh.matrixWorld.decompose(new Vector3(), own, new Vector3());
+        return { origin: new Vector3(...centreOf(shown, pick.indices)).applyMatrix4(pick.mesh.matrixWorld), parent: own, own };
+    }
+
+    /** The change a held handle of a pick makes at the point it is at, with the mesh's `snap` steps */
+    function pickChange(hold: NonNullable<typeof turn>, at: Vector3 | undefined, y: number): PickChange | undefined {
+        const { tree, handle, origin, axis, grab } = hold;
+        const snap = tree.properties.snap === true;
+        const scale = (factor: number): number => Math.max(MIN_GIZMO_SCALE, snap ? Math.round(factor / SCALE_SNAP) * SCALE_SNAP : factor);
+        if (handle.axis === 3) return { kind: 'scale', axis: 3, factor: scale(2 ** ((hold.y - y) / GIZMO_PIXELS)) };
+        if (at === undefined || hold.pick === undefined) return undefined;
+        if (handle.mode === 'move') {
+            const step = typeof tree.properties.step === 'number' && tree.properties.step > 0 ? tree.properties.step : DEFAULT_STEP_3D;
+            const local = (point: Vector3): number => point.clone().applyMatrix4(hold.pick?.inverse ?? new Matrix4()).getComponent(handle.axis);
+            const by = local(at) - local(grab);
+            return { kind: 'move', axis: handle.axis, by: snap ? Math.round(by / step) * step : by };
+        }
+        if (handle.mode === 'rotate') {
+            const from = grab.clone().sub(origin);
+            const to = at.clone().sub(origin);
+            const degrees = MathUtils.radToDeg(Math.atan2(from.clone().cross(to).dot(axis), from.dot(to)));
+            return { kind: 'turn', axis: handle.axis, degrees: snap ? Math.round(degrees / ROTATE_SNAP) * ROTATE_SNAP : degrees };
+        }
+        const from = grab.clone().sub(origin).dot(axis);
+        // A grab at the origin has nothing to measure against
+        return Math.abs(from) < 1e-9 ? undefined : { kind: 'scale', axis: handle.axis, factor: scale(at.clone().sub(origin).dot(axis) / from) };
+    }
+
+    /** Draws a held pick's mesh and overlay over moved vertices, in the renderer only; none puts the geometry back */
+    function showPick(hold: PickHold, path: string, vertices?: readonly Vec3[]): void {
+        const drawn = hold.mesh.geometry;
+        hold.mesh.geometry = vertices === undefined ? hold.original : createGeometry(geometryParams({ ...hold.geometry, vertices: vertices.map((vertex) => [...vertex]) }));
+        if (drawn !== hold.original) drawn.dispose();
+        overlay.show(path, vertices);
+        invalidateByItself();
+    }
+
     /** The handle under a point, ready to hold: the node, its axis in world space and where the ray grabbed it */
     function handleAt(x: number, y: number): Omit<NonNullable<typeof turn>, 'pointer' | 'x' | 'y' | 'moved'> | undefined {
         if (gizmos.size === 0 || !castAt(x, y)) return undefined;
@@ -741,7 +826,14 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         const property = GIZMO_PROPERTY[handle.mode];
         const axis = new Vector3();
         if (handle.axis !== 3) axis.setComponent(handle.axis, 1).applyQuaternion(handle.mode === 'scale' ? place.own : place.parent);
-        const found = { tree, held, handle, property, origin: place.origin, axis, inverse: held.parent.clone().invert(), grab: new Vector3(), value: gizmoValue(tree, property) };
+        const pick = pickOf(tree);
+        // A pick turns about the mesh's own axes, whatever the mode
+        if (pick !== undefined && handle.axis !== 3) axis.set(0, 0, 0).setComponent(handle.axis, 1).applyQuaternion(place.own);
+        const hold: PickHold | undefined =
+            pick === undefined
+                ? undefined
+                : { ...pick, geometry: tree.properties.geometry as { [key: string]: JsonValue }, centre: centreOf(pick.vertices, pick.indices), inverse: pick.mesh.matrixWorld.clone().invert(), original: pick.mesh.geometry, shown: pick.vertices };
+        const found = { tree, held, handle, property, origin: place.origin, axis, inverse: held.parent.clone().invert(), grab: new Vector3(), value: gizmoValue(tree, property), pick: hold };
         const grab = grabOf(found);
         return grab === undefined ? undefined : { ...found, grab };
     }
@@ -761,6 +853,13 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         if (turn === undefined || !castAt(x, y)) return;
         const { tree, handle, origin, axis, grab, inverse } = turn;
         const at = grabOf(turn);
+        if (turn.pick !== undefined) {
+            const change = pickChange(turn, at, y);
+            if (change === undefined) return;
+            turn.pick.shown = reshapeVertices(turn.pick.vertices, turn.pick.indices, change, turn.pick.centre);
+            showPick(turn.pick, tree.path, turn.pick.shown);
+            return;
+        }
         if (handle.axis === 3) turn.value = scaledScale(tree, 3, 2 ** ((turn.y - y) / GIZMO_PIXELS));
         else if (at === undefined) return;
         else if (handle.mode === 'move') {
@@ -787,6 +886,15 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         gizmos.hold();
         view?.removeEventListener('keydown', onDragKey, true);
         if (ended === undefined) return;
+        if (ended.pick !== undefined) {
+            // A pick moved: one write of the whole geometry; the moved geometry stays drawn until the state's comes back
+            if (putBack || !ended.moved) showPick(ended.pick, ended.tree.path);
+            else {
+                ended.pick.original.dispose();
+                options.onGeometry?.({ path: ended.tree.path, geometry: { ...ended.pick.geometry, vertices: ended.pick.shown.map((vertex) => [...vertex]) } });
+            }
+            return;
+        }
         if (putBack || !ended.moved) {
             ended.held.show();
             invalidateByItself();

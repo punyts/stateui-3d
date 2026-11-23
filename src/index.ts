@@ -2,9 +2,9 @@ import type { createScene3d } from './scene3d.js';
 
 export { CONTEXT_RESTORE_TIMEOUT, createScene3d } from './scene3d.js';
 export type { Scene3d, Scene3dInfo, Scene3dOptions, Scene3dStatus } from './scene3d.js';
-export type { MeshPick, NodeMove, Scene3dEvent } from './scene3d.js';
-export { EDGE_PICK_PIXELS, EDIT_COLORS, EDIT_MODES, VERTEX_PICK_PIXELS, editModeOf, meshEdges, nearPoints, readPicked, segmentDistance, togglePick } from './edit.js';
-export type { EditElement, EditMode, ScreenPoint } from './edit.js';
+export type { MeshGeometry, MeshPick, NodeMove, Scene3dEvent } from './scene3d.js';
+export { EDGE_PICK_PIXELS, EDIT_COLORS, EDIT_MODES, VERTEX_PICK_PIXELS, centreOf, editModeOf, meshEdges, nearPoints, pickedVertices, readPicked, reshapeVertices, segmentDistance, togglePick } from './edit.js';
+export type { EditElement, EditMode, PickChange, ScreenPoint } from './edit.js';
 export { DEFAULT_STEP_3D, dragAxes3d, keepPosition3d, positionOf3d, stepMove3d } from './drag.js';
 export type { DragAxis3d } from './drag.js';
 export { PRESS_SLOP, PressGesture, interactiveNodes, isShownNode, screenBox } from './interaction.js';
