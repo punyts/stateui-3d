@@ -539,16 +539,17 @@ export class RepeatRows {
     }
 
     /**
-     * Draws the node at `rest` at `position` (its parent's space), only the instances of its copy, in the renderer; with
-     * no position, draws the copies as last synced again (a drag put back, or ended before the records change)
+     * Draws the node at `rest` with `value` as its `property` (`position` in its parent's space by default, or a gizmo's
+     * `rotation` or `scale`), only the instances of its copy, in the renderer; with no value, draws the copies as last
+     * synced again (a drag put back, or ended before the records change)
      */
-    move(rest: string, position?: Vector3Tuple): void {
+    move(rest: string, value?: Vector3Tuple, property = 'position'): void {
         const [key, below] = splitRest(rest);
         const moved = (node: Scene3dTree, at: string): Scene3dTree =>
             at === below
-                ? { ...node, properties: { ...node.properties, position: [...(position as Vector3Tuple)] } }
+                ? { ...node, properties: { ...node.properties, [property]: [...(value as Vector3Tuple)] } }
                 : { ...node, children: node.children.map((child) => moved(child, `${at}.children.${child.key}`)) };
-        const copies = position === undefined ? this.copies : this.copies.map((copy) => (copy.key === key ? moved(copy, '') : copy));
+        const copies = value === undefined ? this.copies : this.copies.map((copy) => (copy.key === key ? moved(copy, '') : copy));
         for (const instances of this.parts.values()) instances.sync(copies);
     }
 

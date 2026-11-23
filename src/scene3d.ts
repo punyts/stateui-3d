@@ -1,4 +1,4 @@
-import { Box3, Matrix4, OrthographicCamera, PerspectiveCamera, Plane, Raycaster, SRGBColorSpace, Vector2, Vector3 } from 'three';
+import { Box3, Euler, MathUtils, Matrix4, OrthographicCamera, PerspectiveCamera, Plane, Quaternion, Raycaster, SRGBColorSpace, Vector2, Vector3 } from 'three';
 import type { Camera, Object3D } from 'three';
 import { DEFAULT_FOV, activeCamera, frameBounds, orthographicHeight } from './cameras.js';
 import { controlsMode, createCameraControls } from './controls.js';
@@ -19,6 +19,8 @@ import type { InstanceLayout } from './instances.js';
 import type { ReadSceneFile, Scene3dIssue } from './scene.js';
 import type { LabelHooks } from './labels.js';
 import { writeGlb } from './glbWriter.js';
+import { GIZMO_PIXELS, GIZMO_PROPERTY, Gizmos, gizmoValue, movedPosition, scaledScale, turnedRotation } from './gizmo.js';
+import type { GizmoHandle, GizmoPlace, GizmoProperty } from './gizmo.js';
 import type { Bounds3d, ColorResolver, JsonValue, Scene3dSettings, Scene3dTree, Vector3Tuple } from './tree.js';
 
 /** What a scene is made with */
@@ -76,8 +78,9 @@ export interface Scene3dOptions {
     readonly onEvent?: (event: Scene3dEvent) => void;
     /**
      * Told a dragged node's new `position` (in its parent's space) once when a drag ends, and for each arrow key on its
-     * proxy (docs/design/stateui-3d-drag.md): the feeder writes it, then `onEvent` is told `dragEnd`. Never told during a
-     * drag. Without it no node is dragged
+     * proxy (docs/design/stateui-3d-drag.md), or the `position`, `rotation` or `scale` a gizmo's handle changed
+     * (docs/design/stateui-3d-gizmo.md): the feeder writes it, then `onEvent` is told `dragEnd`. Never told during a
+     * drag. Without it no node is dragged and no gizmo is shown
      */
     readonly onMove?: (move: NodeMove) => void;
     /**
@@ -99,10 +102,11 @@ export interface Scene3dEvent {
     readonly point: Vector3Tuple;
 }
 
-/** A dragged node's new `position`, in its parent's space, by its state path (`onMove`) */
+/** A node's new `position` (its parent's space), `rotation` (degrees) or `scale` after a drag or a gizmo, by its state path (`onMove`) */
 export interface NodeMove {
     readonly path: string;
-    readonly position: Vector3Tuple;
+    readonly property: GizmoProperty;
+    readonly value: Vector3Tuple;
 }
 
 /** What `onStatus` of the scene's options is told (see there) */
@@ -137,6 +141,8 @@ export interface Scene3dInfo {
     readonly instances: number;
     /** The `label3d` nodes that draw a text (G3.6b) */
     readonly labels: number;
+    /** The nodes whose gizmo is shown (docs/design/stateui-3d-gizmo.md) */
+    readonly gizmos: number;
 }
 
 /**
@@ -203,10 +209,13 @@ export interface Scene3d {
 /** A colour resolver that takes a literal as it is and resolves no token */
 const literalColors: ColorResolver = (value: JsonValue) => (typeof value === 'string' && value.trim() !== '' && !value.trim().startsWith('{') ? value : undefined);
 
-/** Where a node a drag moves sits: its parent's world matrix, and how the renderer shows it at a position (none: as the tree has it) */
+/**
+ * Where a node a drag or a gizmo changes sits: its parent's world matrix, and how the renderer shows it with a value of
+ * one property (`position` by default; none: as the tree has it)
+ */
 interface Held {
     readonly parent: Matrix4;
-    show(position?: Vector3Tuple): void;
+    show(value?: Vector3Tuple, property?: GizmoProperty): void;
 }
 
 /**
@@ -231,6 +240,9 @@ function labelHooks(host: Element, options: Scene3dOptions): LabelHooks {
 
 /** A number without the noise of the matrix maths (the point of a press or a hover, G3.8) */
 const clean = (value: number): number => Math.round(value * 1e6) / 1e6 + 0;
+
+/** A `rotation` in degrees as three.js's turn */
+const eulerOf = (degrees: Vector3Tuple): Euler => new Euler(MathUtils.degToRad(degrees[0]), MathUtils.degToRad(degrees[1]), MathUtils.degToRad(degrees[2]));
 
 /** True when the object and every ancestor up to the root are visible */
 function shown(object: Object3D | null, root: Object3D): boolean {
@@ -333,6 +345,10 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     let drag: { tree: Scene3dTree; held: Held; inverse: Matrix4; pointer: number; x: number; y: number; plane: Plane; offset: Vector3; moved: boolean; position: Vector3Tuple } | undefined;
     /** True when the scene set the canvas's `touch-action` for a draggable node */
     let ownTouch = false;
+    // The gizmos of the nodes with `gizmo` (docs/design/stateui-3d-gizmo.md), drawn over the scene
+    const gizmos = new Gizmos();
+    /** The handle a pointer holds: the node, its axis in world space, where it was grabbed, the value it shows now */
+    let turn: { tree: Scene3dTree; held: Held; handle: GizmoHandle; property: GizmoProperty; pointer: number; x: number; y: number; origin: Vector3; axis: Vector3; inverse: Matrix4; grab: Vector3; value: Vector3Tuple; moved: boolean } | undefined;
     let reducedMotion = options.reducedMotion ?? false;
     let disposed = false;
     let frame: number | undefined;
@@ -494,6 +510,14 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         webgl.render(graph.scene, camera);
         // G3.8: the proxies follow the nodes and the camera of this frame
         placeProxies(camera);
+        // The gizmos, over the scene: a pass of their own with the depth cleared
+        if (gizmos.size > 0) {
+            gizmos.place(camera, renderer.size.height, placeOf);
+            webgl.autoClear = false;
+            webgl.clearDepth();
+            webgl.render(gizmos.scene, camera);
+            webgl.autoClear = true;
+        }
         // The models and maps (G3.7c) being loaded are not on screen yet: waiting goes on until the frame after the last
         // one settles, and while a transition runs until the frame it ends in (G3.9)
         if (graph.loading > 0 || motion.running > 0) return;
@@ -624,8 +648,9 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         interactive = new Map(nodes.map((node) => [node.path, node]));
         proxies.sync(nodes);
         if (hovered !== undefined && !interactive.has(hovered)) hovered = undefined;
+        if (options.onMove !== undefined) gizmos.sync(nodes);
         // A drag on a touch screen must not scroll the page
-        const draggable = options.onMove !== undefined && nodes.some((node) => dragAxes3d(node).length > 0);
+        const draggable = options.onMove !== undefined && (gizmos.size > 0 || nodes.some((node) => dragAxes3d(node).length > 0));
         if (draggable && canvas.style.touchAction !== 'none') {
             canvas.style.touchAction = 'none';
             ownTouch = true;
@@ -644,11 +669,104 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     function heldOf(tree: Scene3dTree): Held | undefined {
         graph.root.updateWorldMatrix(true, true);
         const object = graph.objectOf(tree.path);
-        if (object !== undefined) return { parent: object.parent?.matrixWorld.clone() ?? new Matrix4(), show: (position) => object.position.set(...(position ?? positionOf3d(tree))) };
+        if (object !== undefined) {
+            return {
+                parent: object.parent?.matrixWorld.clone() ?? new Matrix4(),
+                show: (value, property = 'position') => {
+                    const of = (name: GizmoProperty): Vector3Tuple => (value !== undefined && name === property ? value : gizmoValue(tree, name));
+                    object.position.set(...of('position'));
+                    object.rotation.copy(eulerOf(of('rotation')));
+                    object.scale.set(...of('scale'));
+                }
+            };
+        }
         const copy = graph.copyAt(tree.path);
         const node = copy?.rows.nodeAt(copy.rest);
         if (copy === undefined || node === undefined) return undefined;
-        return { parent: node.parent.premultiply(copy.group.matrixWorld), show: (position) => copy.rows.move(copy.rest, position) };
+        return { parent: node.parent.premultiply(copy.group.matrixWorld), show: (value, property) => copy.rows.move(copy.rest, value, property) };
+    }
+
+    /** Where a node's gizmo sits, with the value its held handle shows; undefined for a node that draws nothing */
+    function placeOf(tree: Scene3dTree): GizmoPlace | undefined {
+        const held = heldOf(tree);
+        if (held === undefined) return undefined;
+        const shows = (name: GizmoProperty): Vector3Tuple => (turn?.tree.path === tree.path && turn.property === name ? turn.value : gizmoValue(tree, name));
+        const parent = new Quaternion();
+        held.parent.decompose(new Vector3(), parent, new Vector3());
+        return { origin: new Vector3(...shows('position')).applyMatrix4(held.parent), parent, own: parent.clone().multiply(new Quaternion().setFromEuler(eulerOf(shows('rotation')))) };
+    }
+
+    /** Points the raycaster through a point of the host in CSS pixels; false on an empty canvas */
+    function castAt(x: number, y: number): boolean {
+        const { width, height } = renderer.size;
+        if (width <= 0 || height <= 0) return false;
+        raycaster.setFromCamera(new Vector2((x / width) * 2 - 1, -(y / height) * 2 + 1), currentCamera());
+        return true;
+    }
+
+    /** The handle under a point, ready to hold: the node, its axis in world space and where the ray grabbed it */
+    function handleAt(x: number, y: number): Omit<NonNullable<typeof turn>, 'pointer' | 'x' | 'y' | 'moved'> | undefined {
+        if (gizmos.size === 0 || !castAt(x, y)) return undefined;
+        const handle = gizmos.handleAt(raycaster);
+        const tree = handle === undefined ? undefined : interactive.get(handle.path);
+        const held = tree === undefined ? undefined : heldOf(tree);
+        const place = tree === undefined ? undefined : placeOf(tree);
+        if (handle === undefined || tree === undefined || held === undefined || place === undefined) return undefined;
+        const property = GIZMO_PROPERTY[handle.mode];
+        const axis = new Vector3();
+        if (handle.axis !== 3) axis.setComponent(handle.axis, 1).applyQuaternion(handle.mode === 'scale' ? place.own : place.parent);
+        const found = { tree, held, handle, property, origin: place.origin, axis, inverse: held.parent.clone().invert(), grab: new Vector3(), value: gizmoValue(tree, property) };
+        const grab = grabOf(found);
+        return grab === undefined ? undefined : { ...found, grab };
+    }
+
+    /** Where the ray meets a held handle: the point of its axis nearest the ray (move, scale), or the ring's plane (rotate) */
+    function grabOf(held: { handle: GizmoHandle; origin: Vector3; axis: Vector3 }): Vector3 | undefined {
+        const point = new Vector3();
+        if (held.handle.axis === 3) return point;
+        if (held.handle.mode === 'rotate') return raycaster.ray.intersectPlane(new Plane().setFromNormalAndCoplanarPoint(held.axis, held.origin), point) ?? undefined;
+        const reach = held.axis.clone().multiplyScalar(1e4);
+        raycaster.ray.distanceSqToSegment(held.origin.clone().sub(reach), held.origin.clone().add(reach), undefined, point);
+        return point;
+    }
+
+    /** Shows the node with the value the held handle gives at a point of the host, in the renderer only */
+    function turnTo(x: number, y: number): void {
+        if (turn === undefined || !castAt(x, y)) return;
+        const { tree, handle, origin, axis, grab, inverse } = turn;
+        const at = grabOf(turn);
+        if (handle.axis === 3) turn.value = scaledScale(tree, 3, 2 ** ((turn.y - y) / GIZMO_PIXELS));
+        else if (at === undefined) return;
+        else if (handle.mode === 'move') {
+            const local = (point: Vector3): number => point.clone().applyMatrix4(inverse).getComponent(handle.axis);
+            turn.value = movedPosition(tree, handle.axis, gizmoValue(tree, 'position')[handle.axis] + local(at) - local(grab));
+        } else if (handle.mode === 'rotate') {
+            const from = grab.clone().sub(origin);
+            const to = at.clone().sub(origin);
+            turn.value = turnedRotation(tree, handle.axis, MathUtils.radToDeg(Math.atan2(from.clone().cross(to).dot(axis), from.dot(to))));
+        } else {
+            const from = grab.clone().sub(origin).dot(axis);
+            // A grab at the origin has nothing to measure against
+            if (Math.abs(from) < 1e-9) return;
+            turn.value = scaledScale(tree, handle.axis, at.clone().sub(origin).dot(axis) / from);
+        }
+        turn.held.show(turn.value, turn.property);
+        invalidateByItself();
+    }
+
+    /** Ends a held handle: a finished one tells `onMove` and `dragEnd`; one called off (`putBack`) shows the node as the tree has it */
+    function endTurn(putBack: boolean): void {
+        const ended = turn;
+        turn = undefined;
+        gizmos.hold();
+        view?.removeEventListener('keydown', onDragKey, true);
+        if (ended === undefined) return;
+        if (putBack || !ended.moved) {
+            ended.held.show();
+            invalidateByItself();
+            return;
+        }
+        finishMove(ended.tree, ended.value, ended.property);
     }
 
     /** The draggable node under a point and the plane it moves on: its parent's x-z plane through its position */
@@ -691,23 +809,27 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         finishMove(ended.tree, ended.position);
     }
 
-    /** A finished move: the node rests at the position (no transition back from where it was), `onMove`, then `dragEnd` */
-    function finishMove(tree: Scene3dTree, position: Vector3Tuple): void {
-        motion.settle(tree.path, { position: [...position] });
+    /**
+     * A finished move: the node rests with the value (no transition back from where it was), `onMove`, then `dragEnd` at
+     * the node's position in world space
+     */
+    function finishMove(tree: Scene3dTree, value: Vector3Tuple, property: GizmoProperty = 'position'): void {
+        motion.settle(tree.path, { [property]: [...value] });
         const held = heldOf(tree);
-        held?.show(position);
-        options.onMove?.({ path: tree.path, position });
-        if (held !== undefined) raise('dragEnd', tree, new Vector3(...position).applyMatrix4(held.parent));
+        held?.show(value, property);
+        options.onMove?.({ path: tree.path, property, value });
+        if (held !== undefined) raise('dragEnd', tree, new Vector3(...(property === 'position' ? value : positionOf3d(tree))).applyMatrix4(held.parent));
         invalidateByItself();
     }
 
-    /** Escape during a drag puts the node back */
+    /** Escape during a drag or while a handle is held puts the node back */
     const onDragKey = (event: KeyboardEvent): void => {
-        if (event.key !== 'Escape' || drag === undefined) return;
+        if (event.key !== 'Escape' || (drag === undefined && turn === undefined)) return;
         event.preventDefault();
         event.stopPropagation();
         press.cancel();
         endDrag(true);
+        endTurn(true);
     };
 
     /** An arrow key on the proxy of a draggable node moves it by its step: a finished move. True when it moved */
@@ -730,7 +852,23 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         if (disposed || event.button !== 0) return;
         const [x, y] = pointAt(event);
         press.down(event.pointerId, x, y);
-        if (drag !== undefined || !event.isPrimary) return;
+        if (drag !== undefined || turn !== undefined || !event.isPrimary) return;
+        // A handle of a gizmo, before the nodes: the gesture is the handle's, never a press
+        const handle = handleAt(x, y);
+        if (handle !== undefined) {
+            event.stopImmediatePropagation();
+            turn = { ...handle, pointer: event.pointerId, x, y, moved: false };
+            gizmos.hold(handle.handle);
+            canvas.style.cursor = 'grabbing';
+            try {
+                canvas.setPointerCapture(event.pointerId);
+            } catch {
+                // A pointer that is gone already: its up or cancel ends the turn
+            }
+            view?.addEventListener('keydown', onDragKey, true);
+            invalidateByItself();
+            return;
+        }
         const found = interactive.size > 0 ? draggableAt(x, y) : undefined;
         if (found === undefined) return;
         // The gesture is the node's: the camera controls, listening after this, do not see it
@@ -749,6 +887,12 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         if (disposed) return;
         const [x, y] = pointAt(event);
         press.move(event.pointerId, x, y);
+        if (turn !== undefined && event.pointerId === turn.pointer) {
+            if (!turn.moved && Math.hypot(x - turn.x, y - turn.y) <= PRESS_SLOP) return;
+            turn.moved = true;
+            turnTo(x, y);
+            return;
+        }
         if (drag !== undefined && event.pointerId === drag.pointer) {
             if (!drag.moved && Math.hypot(x - drag.x, y - drag.y) <= PRESS_SLOP) return;
             drag.moved = true;
@@ -759,7 +903,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         // A drag is not a hover, and keeps its cursor
         if (event.buttons !== 0) return;
         const found = interactive.size > 0 ? pick(x, y) : undefined;
-        const cursor = found !== undefined && options.onMove !== undefined && dragAxes3d(found.tree).length > 0 ? 'grab' : controls.mode !== 'none' ? 'move' : found !== undefined ? 'pointer' : '';
+        const onHandle = gizmos.size > 0 && castAt(x, y) && gizmos.handleAt(raycaster) !== undefined;
+        const cursor = onHandle || (found !== undefined && options.onMove !== undefined && dragAxes3d(found.tree).length > 0) ? 'grab' : controls.mode !== 'none' ? 'move' : found !== undefined ? 'pointer' : '';
         if (canvas.style.cursor !== cursor) canvas.style.cursor = cursor;
         const path = found?.tree.path;
         if (path === hovered) return;
@@ -771,6 +916,12 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     const onPointerUp = (event: PointerEvent): void => {
         if (disposed) return;
         const [x, y] = pointAt(event);
+        if (turn !== undefined && event.pointerId === turn.pointer) {
+            press.cancel();
+            canvas.style.cursor = 'grab';
+            endTurn(false);
+            return;
+        }
         if (drag !== undefined && event.pointerId === drag.pointer && drag.moved) {
             press.cancel();
             canvas.style.cursor = 'grab';
@@ -786,6 +937,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     const onPointerCancel = (): void => {
         press.cancel();
         endDrag(true);
+        endTurn(true);
     };
 
     const onPointerLeave = (): void => {
@@ -895,7 +1047,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
                 animations: animations.playing,
                 clips: clips.playing,
                 instances: graph.instances,
-                labels: graph.labels.drawn
+                labels: graph.labels.drawn,
+                gizmos: gizmos.size
             };
         },
         setReducedMotion(reduced) {
@@ -942,6 +1095,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             canvas.removeEventListener('pointerleave', onPointerLeave);
             view?.removeEventListener('keydown', onDragKey, true);
             drag = undefined;
+            turn = undefined;
+            gizmos.dispose();
             proxies.dispose();
             interactive = new Map();
             hovered = undefined;

@@ -29,6 +29,8 @@ export { LIGHT_SCALE, SHADOW_MAP_SIZE, lightIntensity } from './scene.js';
 export type { ReadSceneFile, Scene3dIssue } from './scene.js';
 export { GLB_MAGIC, decodeDataUri, decodeGlb, encodeGlb, inspectGlb, isDataUri } from './glb.js';
 export { writeGlb } from './glbWriter.js';
+export { GIZMO_PIXELS, GIZMO_PROPERTY, Gizmos, MIN_GIZMO_SCALE, ROTATE_SNAP, SCALE_SNAP, gizmoMode, gizmoScale, gizmoValue, movedPosition, scaledScale, turnedRotation } from './gizmo.js';
+export type { GizmoAxis, GizmoHandle, GizmoMode, GizmoPlace, GizmoProperty } from './gizmo.js';
 export type { GlbInspection, GltfJson, ModelRefusal, ModelRefusalCode } from './glb.js';
 export { BITMAP_IMAGES_PLUGIN, BITMAP_OPTIONS, ModelError, bitmapImages, disposeModel, parseModel } from './models.js';
 export { MAP_BITMAP_OPTIONS, MapTextures, TEXTURE_FILE_TYPES, mapSource } from './textures.js';

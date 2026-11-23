@@ -11,7 +11,12 @@ import { CHUNK_ENTRY, MANIFEST_FILE, buildRuntimeChunk } from './build.ts';
  * stories add those parts; the build fails when it is more than 15% above it
  */
 const G3_1_GZIP_BYTES = 167_830;
-const GZIP_LIMIT = Math.floor(G3_1_GZIP_BYTES * 1.15);
+/**
+ * What the move, rotate and scale gizmo added, measured when it was built: the gate was raised by it, keeping the room
+ * left before it (owner, 2026-11-23; docs/design/stateui-3d-gizmo.md)
+ */
+const GIZMO_GZIP_BYTES = 2_265;
+const GZIP_LIMIT = Math.floor(G3_1_GZIP_BYTES * 1.15) + GIZMO_GZIP_BYTES;
 
 describe('buildRuntimeChunk', () => {
     let dir: string;

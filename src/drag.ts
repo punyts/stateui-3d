@@ -39,21 +39,21 @@ function stepOf(tree: Scene3dTree): number {
 }
 
 /**
- * Where a drag or a key may put the node when it asks for `wanted`: the axes it does not move on keep the node's own
- * values, `snap` rounds the moving axes to multiples of `step`, and `bounds` (`{ x, z, width, depth }`) keeps them inside
+ * Where a drag, a key or a move handle (docs/design/stateui-3d-gizmo.md) may put the node when it asks for `wanted`: the
+ * axes it does not move on (`axes`, default the ones `draggable` names) keep the node's own values, `snap` rounds the
+ * moving axes to multiples of `step`, and `bounds` (`{ x, z, width, depth }`) keeps x and z inside
  */
-export function keepPosition3d(tree: Scene3dTree, wanted: Vector3Tuple): Vector3Tuple {
-    const axes = dragAxes3d(tree);
+export function keepPosition3d(tree: Scene3dTree, wanted: Vector3Tuple, axes: readonly ('x' | 'y' | 'z')[] = dragAxes3d(tree)): Vector3Tuple {
     const at = positionOf3d(tree);
     const result: [number, number, number] = [...at];
     const bounds = tree.properties.bounds;
     const box = typeof bounds === 'object' && bounds !== null && !Array.isArray(bounds) ? bounds : undefined;
     for (const axis of axes) {
-        const index = axis === 'x' ? 0 : 2;
-        let value = wanted[index];
+        const index = 'xyz'.indexOf(axis);
+        let value = wanted[index] as number;
         if (tree.properties.snap === true) value = Math.round(value / stepOf(tree)) * stepOf(tree);
-        const min = box === undefined ? undefined : finite(box[axis]);
-        const size = box === undefined ? undefined : finite(box[axis === 'x' ? 'width' : 'depth']);
+        const min = box === undefined || axis === 'y' ? undefined : finite(box[axis]);
+        const size = box === undefined || axis === 'y' ? undefined : finite(box[axis === 'x' ? 'width' : 'depth']);
         if (min !== undefined && size !== undefined && size >= 0) value = Math.min(min + size, Math.max(min, value));
         result[index] = clean(value);
     }
