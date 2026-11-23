@@ -16,7 +16,12 @@ const G3_1_GZIP_BYTES = 167_830;
  * left before it (owner, 2026-11-23; docs/design/stateui-3d-gizmo.md)
  */
 const GIZMO_GZIP_BYTES = 2_265;
-const GZIP_LIMIT = Math.floor(G3_1_GZIP_BYTES * 1.15) + GIZMO_GZIP_BYTES;
+/**
+ * What picking a custom mesh's vertices, edges and faces added, measured when it was built: the gate was raised by it
+ * (owner, 2026-11-23; docs/design/stateui-mesh-editor.md, V2)
+ */
+const MESH_PICK_GZIP_BYTES = 1_932;
+const GZIP_LIMIT = Math.floor(G3_1_GZIP_BYTES * 1.15) + GIZMO_GZIP_BYTES + MESH_PICK_GZIP_BYTES;
 
 describe('buildRuntimeChunk', () => {
     let dir: string;

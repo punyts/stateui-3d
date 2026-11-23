@@ -42,8 +42,8 @@ export type GeometryParams =
     | CustomParams;
 
 /**
- * A `custom` geometry, read: its vertices (each coordinate cut to `MAX_SIZE`) and the faces that can be drawn, at most the
- * limits; `bad` is the index of the first face left out (fewer than 3 or more than `MAX_FACE_SIDES` indices, an index
+ * A `custom` geometry, read: its vertices (each coordinate cut to `MAX_SIZE`) and its faces, at most the limits, each in
+ * its place so a face's index is the document's; a face that cannot be drawn is empty. `bad` is the index of the first (fewer than 3 or more than `MAX_FACE_SIDES` indices, an index
  * that is not one of a well-formed vertex, or one repeated), or of the first past the limit
  */
 export interface CustomParams {
@@ -125,8 +125,12 @@ function customParams(geometry: { [key: string]: JsonValue }): CustomParams {
             face.length <= MAX_FACE_SIDES &&
             new Set(face).size === face.length &&
             face.every((at) => typeof at === 'number' && Number.isInteger(at) && at >= 0 && at < vertices.length && !holes.has(at));
-        if (fits) faces.push(face as number[]);
-        else bad ??= index;
+        if (index >= MAX_EDIT_FACES) bad ??= index;
+        else if (fits) faces.push(face as number[]);
+        else {
+            faces.push([]);
+            bad ??= index;
+        }
     });
     const shading: Shading = geometry.shading === 'smooth' ? 'smooth' : 'flat';
     return bad === undefined ? { kind: 'custom', vertices, faces, shading } : { kind: 'custom', vertices, faces, shading, bad };
@@ -135,14 +139,19 @@ function customParams(geometry: { [key: string]: JsonValue }): CustomParams {
 /**
  * The three.js geometry of a `custom` geometry: each face a fan of triangles from its first vertex. Flat shading gives
  * every triangle its own corners, so each face shows its own normal; smooth shares the vertices, so normals are
- * averaged where faces meet. No texture coordinates
+ * averaged where faces meet. No texture coordinates. `userData.faceOf` holds the face of each triangle, for picking
  */
 function customGeometry({ vertices, faces, shading }: CustomParams): BufferGeometry {
     const triangles: number[] = [];
-    for (const face of faces) {
-        for (let at = 1; at < face.length - 1; at += 1) triangles.push(face[0] as number, face[at] as number, face[at + 1] as number);
-    }
+    const faceOf: number[] = [];
+    faces.forEach((face, index) => {
+        for (let at = 1; at < face.length - 1; at += 1) {
+            triangles.push(face[0] as number, face[at] as number, face[at + 1] as number);
+            faceOf.push(index);
+        }
+    });
     const made = new BufferGeometry();
+    made.userData.faceOf = faceOf;
     if (shading === 'smooth') {
         made.setAttribute('position', new Float32BufferAttribute(vertices.flat(), 3));
         made.setIndex(triangles);

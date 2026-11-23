@@ -61,7 +61,7 @@ describe('custom geometry', () => {
         expect(params).toEqual({ kind: 'custom', vertices: cube.vertices, faces: cube.faces, shading: 'flat' });
     });
 
-    it('should leave out the faces that cannot be drawn and name the first', () => {
+    it('should empty the faces that cannot be drawn, keeping every face in its place, and name the first', () => {
         // Arrange
         const value = { ...cube, vertices: [...cube.vertices, [0, 'up', 0]], faces: [[0, 1], [0, 3, 2, 1], [0, 1, 8], [0, 1, 1], [0, 1, 99], [1, 2, 2.5]] };
 
@@ -69,7 +69,7 @@ describe('custom geometry', () => {
         const params = geometryParams(value);
 
         // Assert
-        expect(params).toMatchObject({ kind: 'custom', faces: [[0, 3, 2, 1]], bad: 0 });
+        expect(params).toMatchObject({ kind: 'custom', faces: [[], [0, 3, 2, 1], [], [], [], []], bad: 0 });
     });
 
     it('should keep at most the limits of vertices, faces and sides, and cut coordinates to the largest size', () => {

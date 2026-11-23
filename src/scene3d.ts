@@ -1,5 +1,5 @@
 import { Box3, Euler, MathUtils, Matrix4, OrthographicCamera, PerspectiveCamera, Plane, Quaternion, Raycaster, SRGBColorSpace, Vector2, Vector3 } from 'three';
-import type { Camera, Object3D } from 'three';
+import type { Camera, Mesh, Object3D } from 'three';
 import { DEFAULT_FOV, activeCamera, frameBounds, orthographicHeight } from './cameras.js';
 import { controlsMode, createCameraControls } from './controls.js';
 import type { CameraMove, CameraView } from './controls.js';
@@ -21,6 +21,8 @@ import type { LabelHooks } from './labels.js';
 import { writeGlb } from './glbWriter.js';
 import { GIZMO_PIXELS, GIZMO_PROPERTY, Gizmos, gizmoValue, movedPosition, scaledScale, turnedRotation } from './gizmo.js';
 import type { GizmoHandle, GizmoPlace, GizmoProperty } from './gizmo.js';
+import { EDGE_PICK_PIXELS, EditOverlay, VERTEX_PICK_PIXELS, meshEdges, nearPoints, segmentDistance, togglePick } from './edit.js';
+import type { EditElement, ScreenPoint } from './edit.js';
 import type { Bounds3d, ColorResolver, JsonValue, Scene3dSettings, Scene3dTree, Vector3Tuple } from './tree.js';
 
 /** What a scene is made with */
@@ -84,6 +86,11 @@ export interface Scene3dOptions {
      */
     readonly onMove?: (move: NodeMove) => void;
     /**
+     * Told a mesh's new `edit.picked` once per press that changes it (docs/design/stateui-mesh-editor.md, V2): the feeder
+     * writes it. Without it no mesh is in edit mode
+     */
+    readonly onPick?: (pick: MeshPick) => void;
+    /**
      * Reads the font family a `label3d` draws its text in (G3.6b), when the labels are drawn and again on `restyle`.
      * Default: the host's computed `font-family`, so the page font applies; unset or empty is `sans-serif`
      */
@@ -107,6 +114,12 @@ export interface NodeMove {
     readonly path: string;
     readonly property: GizmoProperty;
     readonly value: Vector3Tuple;
+}
+
+/** A mesh's new pick (`onPick`): the vertex or face indices, or the edges as `[a, b]`, of its `edit.mode` */
+export interface MeshPick {
+    readonly path: string;
+    readonly picked: readonly EditElement[];
 }
 
 /** What `onStatus` of the scene's options is told (see there) */
@@ -143,6 +156,8 @@ export interface Scene3dInfo {
     readonly labels: number;
     /** The nodes whose gizmo is shown (docs/design/stateui-3d-gizmo.md) */
     readonly gizmos: number;
+    /** The meshes in edit mode (docs/design/stateui-mesh-editor.md) */
+    readonly editing: number;
 }
 
 /**
@@ -347,6 +362,9 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     let ownTouch = false;
     // The gizmos of the nodes with `gizmo` (docs/design/stateui-3d-gizmo.md), drawn over the scene
     const gizmos = new Gizmos();
+    // The dots and lines over the meshes in edit mode (docs/design/stateui-mesh-editor.md), and the ray that checks a picked element is in front
+    const overlay = new EditOverlay();
+    const seer = new Raycaster();
     /** The handle a pointer holds: the node, its axis in world space, where it was grabbed, the value it shows now */
     let turn: { tree: Scene3dTree; held: Held; handle: GizmoHandle; property: GizmoProperty; pointer: number; x: number; y: number; origin: Vector3; axis: Vector3; inverse: Matrix4; grab: Vector3; value: Vector3Tuple; moved: boolean } | undefined;
     let reducedMotion = options.reducedMotion ?? false;
@@ -510,6 +528,13 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         webgl.render(graph.scene, camera);
         // G3.8: the proxies follow the nodes and the camera of this frame
         placeProxies(camera);
+        // The edit overlay, over the scene with its depth kept, so what the mesh hides stays hidden
+        if (overlay.size > 0) {
+            overlay.place((path) => graph.objectOf(path));
+            webgl.autoClear = false;
+            webgl.render(overlay.scene, camera);
+            webgl.autoClear = true;
+        }
         // The gizmos, over the scene: a pass of their own with the depth cleared
         if (gizmos.size > 0) {
             gizmos.place(camera, renderer.size.height, placeOf);
@@ -628,7 +653,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     function pressProxy(path: string): void {
         const tree = interactive.get(path);
         const box = tree === undefined ? undefined : worldBox(path);
-        if (tree !== undefined && box !== undefined) raise('press', tree, box.getCenter(new Vector3()));
+        if (tree !== undefined && box !== undefined && overlay.entry(path) === undefined) raise('press', tree, box.getCenter(new Vector3()));
     }
 
     /** Puts each proxy over the box its node covers on the canvas through the camera of the frame just drawn */
@@ -649,6 +674,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         proxies.sync(nodes);
         if (hovered !== undefined && !interactive.has(hovered)) hovered = undefined;
         if (options.onMove !== undefined) gizmos.sync(nodes);
+        if (options.onPick !== undefined) overlay.sync(nodes, (path) => graph.objectOf(path));
         // A drag on a touch screen must not scroll the page
         const draggable = options.onMove !== undefined && (gizmos.size > 0 || nodes.some((node) => dragAxes3d(node).length > 0));
         if (draggable && canvas.style.touchAction !== 'none') {
@@ -773,7 +799,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
     function draggableAt(x: number, y: number): { tree: Scene3dTree; held: Held; inverse: Matrix4; plane: Plane; offset: Vector3 } | undefined {
         if (options.onMove === undefined) return undefined;
         const found = pick(x, y);
-        const held = found === undefined || dragAxes3d(found.tree).length === 0 ? undefined : heldOf(found.tree);
+        // A mesh in edit mode is not dragged: a press on it picks
+        const held = found === undefined || dragAxes3d(found.tree).length === 0 || overlay.entry(found.tree.path) !== undefined ? undefined : heldOf(found.tree);
         if (found === undefined || held === undefined) return undefined;
         const at = new Vector3(...positionOf3d(found.tree)).applyMatrix4(held.parent);
         const plane = new Plane().setFromNormalAndCoplanarPoint(new Vector3(0, 1, 0).transformDirection(held.parent), at);
@@ -840,6 +867,67 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         if (position === undefined) return false;
         finishMove(tree, position);
         return true;
+    }
+
+    // Picking in edit mode (docs/design/stateui-mesh-editor.md, V2) -------------------------------------------------
+
+    /** True when a world point of a mesh is in front: nothing of the mesh is nearer the camera along the ray through it */
+    function inFront(mesh: Object3D, point: Vector3, camera: Camera): boolean {
+        const ndc = point.clone().project(camera);
+        seer.setFromCamera(new Vector2(ndc.x, ndc.y), camera);
+        const far = point.clone().sub(seer.ray.origin).dot(seer.ray.direction);
+        const first = seer.intersectObject(mesh, false)[0];
+        return first === undefined || first.distance >= far - 1e-3 * Math.max(1, far);
+    }
+
+    /**
+     * A press in edit mode: the nearest element of its mode in front under the pointer, over every mesh in edit mode (a
+     * vertex within VERTEX_PICK_PIXELS, an edge within EDGE_PICK_PIXELS, or the face hit), replaces the mesh's pick, or
+     * with Shift is added or taken out. Without Shift the other meshes' picks are cleared, so a press beside every mesh
+     * clears them all. Each pick that changes is told to `onPick` once
+     */
+    function pickEdit(x: number, y: number, shift: boolean): void {
+        if (disposed || options.onPick === undefined || !castAt(x, y)) return;
+        const camera = currentCamera();
+        const { width, height } = renderer.size;
+        graph.root.updateWorldMatrix(true, true);
+        const screen = (world: Vector3): ScreenPoint | undefined => {
+            const ndc = world.clone().project(camera);
+            return Math.abs(ndc.z) > 1 ? undefined : [((ndc.x + 1) / 2) * width, ((1 - ndc.y) / 2) * height];
+        };
+        let best: { path: string; element: EditElement; distance: number } | undefined;
+        for (const { tree, mode, params } of overlay.entries()) {
+            const mesh = graph.objectOf(tree.path);
+            if (mesh === undefined) continue;
+            const world = params.vertices.map((vertex) => new Vector3(...vertex).applyMatrix4(mesh.matrixWorld));
+            let found: { element: EditElement; distance: number } | undefined;
+            if (mode === 'vertex') {
+                const near = nearPoints(world.map(screen), x, y, VERTEX_PICK_PIXELS).find(({ index }) => inFront(mesh, world[index] as Vector3, camera));
+                if (near !== undefined) found = { element: near.index, distance: near.distance };
+            } else if (mode === 'edge') {
+                const points = world.map(screen);
+                const near: { edge: [number, number]; distance: number; along: number }[] = [];
+                for (const edge of meshEdges(params.faces)) {
+                    const [a, b] = [points[edge[0]], points[edge[1]]];
+                    const measured = a === undefined || b === undefined ? undefined : segmentDistance(a, b, x, y);
+                    if (measured !== undefined && measured.distance <= EDGE_PICK_PIXELS) near.push({ edge, ...measured });
+                }
+                const front = near
+                    .sort((a, b) => a.distance - b.distance)
+                    .find(({ edge, along }) => inFront(mesh, (world[edge[0]] as Vector3).clone().lerp(world[edge[1]] as Vector3, along), camera));
+                if (front !== undefined) found = { element: front.edge, distance: front.distance };
+            } else {
+                const hit = raycaster.intersectObject(mesh, false)[0];
+                const index = hit?.faceIndex;
+                const face = index === undefined || index === null ? undefined : ((mesh as Mesh).geometry.userData.faceOf as number[] | undefined)?.[index];
+                if (face !== undefined) found = { element: face, distance: 0 };
+            }
+            if (found !== undefined && (best === undefined || found.distance < best.distance)) best = { path: tree.path, ...found };
+        }
+        for (const { tree, picked } of [...overlay.entries()]) {
+            const next = best?.path === tree.path ? togglePick(picked, best.element, shift) : shift ? picked : [];
+            if (JSON.stringify(next) !== JSON.stringify(picked)) options.onPick({ path: tree.path, picked: next });
+        }
     }
 
     /** A pointer event's point in CSS pixels from the canvas's top-left corner */
@@ -931,7 +1019,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
         if (drag !== undefined && event.pointerId === drag.pointer) endDrag(false);
         if (!press.up(event.pointerId, x, y)) return;
         const found = pick(x, y);
-        if (found !== undefined) raise('press', found.tree, found.point);
+        if (overlay.size > 0) pickEdit(x, y, event.shiftKey);
+        if (found !== undefined && overlay.entry(found.tree.path) === undefined) raise('press', found.tree, found.point);
     };
 
     const onPointerCancel = (): void => {
@@ -1048,7 +1137,8 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
                 clips: clips.playing,
                 instances: graph.instances,
                 labels: graph.labels.drawn,
-                gizmos: gizmos.size
+                gizmos: gizmos.size,
+                editing: overlay.size
             };
         },
         setReducedMotion(reduced) {
@@ -1097,6 +1187,7 @@ export function createScene3d(host: Element, options: Scene3dOptions = {}): Scen
             drag = undefined;
             turn = undefined;
             gizmos.dispose();
+            overlay.dispose();
             proxies.dispose();
             interactive = new Map();
             hovered = undefined;
